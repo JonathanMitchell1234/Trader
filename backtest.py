@@ -32,7 +32,7 @@ import numpy as np
 import pandas as pd
 
 import config
-from indicators import compute_all
+from indicators import compute_all, compute_weekly_trend, realized_volatility
 from logger import get_logger
 
 log = get_logger("backtest")
@@ -127,7 +127,8 @@ class Backtester:
 
         # Cooldown tracker: symbol → last exit date
         self._cooldowns: Dict[str, dt.date] = {}
-
+        # Sector exposure tracker: sector -> count of open positions
+        self._sector_counts: Dict[str, int] = {}
         # Commission model (Alpaca is commission-free, but slippage sim)
         self.slippage_pct = 0.0005  # 5 bps slippage per trade
 
@@ -299,9 +300,93 @@ class Backtester:
             return 0.0
         return (cur_close - past_close) / past_close
 
-    # ── strategy evaluation (v3 scoring + momentum) ──────────
-    def _check_entry(self, df: pd.DataFrame, momentum: float = 0.0) -> Optional[dict]:
-        """Scoring-based entry system with momentum bonus."""
+    # ── weekly trend helper ──────────────────────────────────
+    def _is_weekly_bullish(self, symbol: str, date: dt.date) -> bool:
+        """Check if the weekly EMA trend is bullish for a symbol."""
+        if not config.WEEKLY_TREND_ENABLED:
+            return True
+        df = self._data.get(symbol)
+        if df is None:
+            return True
+        subset = df[df.index.date <= date]
+        if len(subset) < config.WEEKLY_EMA_SLOW * 5:
+            return True
+        info = compute_weekly_trend(subset)
+        return info["bullish"]
+
+    # ── volatility regime helper ─────────────────────────────
+    def _vol_regime_scale(self, date: dt.date) -> float:
+        """
+        Compute position-size scale factor based on realized volatility
+        of the regime symbol (SPY).  Returns 0.6 / 1.0 / 1.2.
+        """
+        if not config.VOL_REGIME_ENABLED:
+            return 1.0
+        regime_df = self._regime_data
+        if regime_df is None:
+            return 1.0
+        subset = regime_df[regime_df.index.date <= date]
+        vol = realized_volatility(subset, window=config.REALIZED_VOL_WINDOW)
+        if vol > config.HIGH_VOL_THRESHOLD:
+            return config.HIGH_VOL_SIZE_SCALE
+        if vol < config.LOW_VOL_THRESHOLD:
+            return config.LOW_VOL_SIZE_SCALE
+        return 1.0
+
+    # ── dynamic threshold helper ─────────────────────────────
+    def _dynamic_score_threshold(self, date: dt.date) -> int:
+        """
+        Adjust the entry score threshold based on market quality.
+        Strong market -> lower threshold (easier entries).
+        Weak market -> higher threshold (more conviction needed).
+        """
+        base = config.ENTRY_SCORE_THRESHOLD
+        if not config.DYNAMIC_THRESHOLD_ENABLED or self._regime_data is None:
+            return base
+
+        mask = self._regime_data.index.date <= date
+        if not mask.any():
+            return base
+        regime_subset = self._regime_data.loc[mask]
+        if len(regime_subset) < config.EMA_TREND + 5:
+            return base
+
+        row = regime_subset.iloc[-1]
+        spy_close = row["close"]
+        spy_ema50 = row.get("ema_trend", None)
+        if spy_ema50 is None or pd.isna(spy_ema50):
+            return base
+
+        # Check if SPY EMA-50 is rising
+        if len(regime_subset) >= config.EMA_SLOPE_PERIOD + 1:
+            ema50_ago = regime_subset.iloc[-(config.EMA_SLOPE_PERIOD + 1)].get("ema_trend", None)
+            if ema50_ago is not None and not pd.isna(ema50_ago):
+                if spy_close > spy_ema50 and spy_ema50 > ema50_ago:
+                    return base - 1  # strong market: lower bar (more entries)
+
+        return base
+
+    # ── sector limit helper ──────────────────────────────────
+    def _sector_ok(self, symbol: str) -> bool:
+        """Check if we can open a position in this symbol's sector."""
+        sector = config.SECTOR_MAP.get(symbol, "Other")
+        count = self._sector_counts.get(sector, 0)
+        return count < config.MAX_PER_SECTOR
+
+    def _sector_add(self, symbol: str) -> None:
+        sector = config.SECTOR_MAP.get(symbol, "Other")
+        self._sector_counts[sector] = self._sector_counts.get(sector, 0) + 1
+
+    def _sector_remove(self, symbol: str) -> None:
+        sector = config.SECTOR_MAP.get(symbol, "Other")
+        count = self._sector_counts.get(sector, 0)
+        self._sector_counts[sector] = max(0, count - 1)
+
+    # ── strategy evaluation (v4 scoring + advanced filters) ──
+    def _check_entry(self, df: pd.DataFrame, momentum: float = 0.0,
+                      weekly_bullish: bool = True,
+                      score_threshold: int = 0) -> Optional[dict]:
+        """Scoring-based entry system with momentum bonus + v4 advanced filters."""
         if len(df) < max(config.MOMENTUM_LOOKBACK + 1, config.EMA_SLOPE_PERIOD + 1, 3):
             return None
 
@@ -325,6 +410,14 @@ class Backtester:
         if pd.isna(rsi) or pd.isna(atr) or pd.isna(adx):
             return None
 
+        # ── Gap-up filter: skip exhaustion gaps ──────────────
+        prev_close = prv["close"]
+        today_open = cur["open"]
+        if prev_close > 0 and today_open > 0:
+            gap_pct = (today_open - prev_close) / prev_close
+            if gap_pct > config.GAP_UP_MAX_PCT:
+                return None
+
         score = 0
         factors = []
 
@@ -342,6 +435,7 @@ class Backtester:
         if (prv["ema_fast"] <= prv["ema_slow"]) and (ema_fast > ema_slow):
             score += 2
             factors.append("EMA crossover")
+
         # +1: Trend quality - EMA-50 slope is rising
         if len(df) >= config.EMA_SLOPE_PERIOD + 1:
             ema50_now = cur["ema_trend"]
@@ -349,6 +443,7 @@ class Backtester:
             if not pd.isna(ema50_now) and not pd.isna(ema50_ago) and ema50_now > ema50_ago:
                 score += 1
                 factors.append("EMA-50 rising")
+
         # +2: RSI in pullback zone (30-50)
         if config.RSI_OVERSOLD <= rsi <= 50:
             score += 2
@@ -399,7 +494,28 @@ class Backtester:
             score += 1
             factors.append(f"Momentum +{momentum*100:.0f}%")
 
-        if score < config.ENTRY_SCORE_THRESHOLD:
+        # +1: Weekly trend agrees (multi-timeframe)
+        if config.WEEKLY_TREND_ENABLED and weekly_bullish:
+            score += config.WEEKLY_TREND_BONUS
+            factors.append("Weekly trend OK")
+
+        # +1/-1: Support / Resistance awareness
+        sr_support = cur.get("sr_support", None)
+        sr_resistance = cur.get("sr_resistance", None)
+        if sr_support is not None and not pd.isna(sr_support) and price > 0:
+            dist_to_support = (price - sr_support) / price
+            if dist_to_support <= 0.03:
+                score += config.SR_SUPPORT_BONUS
+                factors.append("Near support")
+        if sr_resistance is not None and not pd.isna(sr_resistance) and price > 0:
+            dist_to_resistance = (sr_resistance - price) / price
+            # Only penalize near resistance if stock is BELOW EMA-50 (overhead resistance)
+            if dist_to_resistance <= config.SR_RESISTANCE_BUFFER and price < ema_trend:
+                score -= 1
+                factors.append("Near resistance (-1)")
+
+        threshold = score_threshold if score_threshold > 0 else config.ENTRY_SCORE_THRESHOLD
+        if score < threshold:
             return None
 
         return {
@@ -585,18 +701,24 @@ class Backtester:
             if reasons:
                 self._close_position(symbol, date, "; ".join(reasons))
 
-        # 3. Scan for new entries (respect market regime + momentum ranking)
+        # 3. Scan for new entries (respect market regime + momentum ranking + v4 filters)
         bull_market = self._is_bull_market(date)
         equity = self._portfolio_value(date)
         max_positions = config.get_max_positions(equity)
         atr_stop_mult = config.get_atr_stop_mult(equity)
         atr_profit_mult = config.get_atr_profit_mult(equity)
+        vol_scale = self._vol_regime_scale(date)
+        dyn_threshold = self._dynamic_score_threshold(date)
 
         if len(self.positions) < max_positions and bull_market:
             # Phase 1: Gather candidates with momentum scores
             candidates = []
             for symbol in self.symbols:
                 if symbol in self.positions:
+                    continue
+
+                # Sector exposure limit
+                if not self._sector_ok(symbol):
                     continue
 
                 # Re-entry cooldown
@@ -635,12 +757,24 @@ class Backtester:
             cutoff = max(1, int(len(candidates) * config.MOMENTUM_TOP_PCT))
             top_candidates = candidates[:cutoff]
 
-            # Phase 3: Score and enter the best
+            # Phase 3: Score and enter the best (with v4 advanced filters)
             for symbol, df, mom in top_candidates:
                 if len(self.positions) >= max_positions:
                     break
 
-                signal = self._check_entry(df, momentum=mom)
+                # Sector re-check (may have filled during this loop)
+                if not self._sector_ok(symbol):
+                    continue
+
+                # Multi-timeframe: weekly trend check (hard filter)
+                weekly_bull = self._is_weekly_bullish(symbol, date)
+                if config.WEEKLY_TREND_ENABLED and not weekly_bull:
+                    continue  # skip entry when weekly trend disagrees
+
+                signal = self._check_entry(
+                    df, momentum=mom, weekly_bullish=weekly_bull,
+                    score_threshold=dyn_threshold,
+                )
                 if signal is None:
                     continue
 
@@ -650,6 +784,11 @@ class Backtester:
                 take_profit = round(entry_price + atr * atr_profit_mult, 2)
 
                 qty = self._size_position(entry_price, stop_loss, date)
+
+                # Apply volatility regime scaling
+                if vol_scale != 1.0:
+                    qty = round(qty * vol_scale, 3) if config.FRACTIONAL_SHARES else math.floor(qty * vol_scale)
+
                 if qty <= 0:
                     continue
 
@@ -672,6 +811,7 @@ class Backtester:
                     qty=qty, stop_loss=stop_loss, take_profit=take_profit,
                     reason=signal["reason"],
                 ))
+                self._sector_add(symbol)
 
         # Record equity at end of day
         equity = self._portfolio_value(date)
@@ -697,6 +837,9 @@ class Backtester:
         hold_days = (date - pos.entry_date).days
 
         self.cash += exit_price * pos.qty
+
+        # Track sector removal
+        self._sector_remove(symbol)
 
         # Record cooldown so we don't re-enter this symbol too soon
         self._cooldowns[symbol] = date

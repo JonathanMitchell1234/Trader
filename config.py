@@ -65,7 +65,7 @@ VOLUME_SMA_PERIOD = 20
 VOLUME_SURGE_FACTOR = 1.0  # 1.0 = normal volume ok (removed as hard gate)
 
 # ── Scoring system – entry signals are scored, not binary ────
-ENTRY_SCORE_THRESHOLD = 5      # minimum score (out of ~14) to trigger a buy
+ENTRY_SCORE_THRESHOLD = 5      # minimum score (out of ~14 base) to trigger a buy
 
 # ── Momentum ranking (buy the strongest stocks) ─────────────
 MOMENTUM_LOOKBACK = 20          # days to measure momentum (rate of change)
@@ -86,6 +86,60 @@ RE_ENTRY_COOLDOWN_DAYS = 5
 MARKET_REGIME_ENABLED = True   # reject new buys in bear markets
 MARKET_REGIME_SYMBOL = "SPY"   # index proxy
 # Bull = SPY above its 200-EMA; Bear = below
+
+# ── Multi-timeframe confirmation (weekly trend) ────────────
+WEEKLY_TREND_ENABLED = False    # disabled for small accounts (blocks momentum plays)
+WEEKLY_EMA_FAST = 10            # ~10-week EMA (approximately 50-day)
+WEEKLY_EMA_SLOW = 40            # ~40-week EMA (approximately 200-day)
+WEEKLY_TREND_BONUS = 0          # no scoring bonus; used as hard filter instead
+
+# ── Volatility regime (adaptive sizing via realized vol) ────
+VOL_REGIME_ENABLED = False      # disabled for testing
+REALIZED_VOL_WINDOW = 20        # days to measure realized volatility
+HIGH_VOL_THRESHOLD = 0.30       # annualized vol above 30% = high vol
+LOW_VOL_THRESHOLD = 0.12        # annualized vol below 12% = low vol
+HIGH_VOL_SIZE_SCALE = 0.80      # reduce position to 80% in high vol
+LOW_VOL_SIZE_SCALE = 1.15       # increase position to 115% in low vol
+
+# ── Sector exposure limits ─────────────────────────────────
+MAX_PER_SECTOR = 99             # effectively disabled for testing
+SECTOR_MAP = {
+    "AAPL": "Tech", "MSFT": "Tech", "GOOGL": "Tech", "AMZN": "Tech",
+    "META": "Tech", "NVDA": "Tech", "AMD": "Tech", "TSM": "Tech",
+    "CRM": "Tech", "ADBE": "Tech", "NFLX": "Tech", "QCOM": "Tech",
+    "INTC": "Tech", "AVGO": "Tech", "MU": "Tech",
+    "PLTR": "Tech", "SOFI": "Fintech", "MARA": "Crypto", "HOOD": "Fintech",
+    "SNAP": "Tech", "U": "Tech",
+    "JPM": "Finance", "BAC": "Finance", "GS": "Finance", "MS": "Finance",
+    "V": "Finance", "MA": "Finance", "AXP": "Finance",
+    "C": "Finance", "SCHW": "Finance",
+    "JNJ": "Health", "UNH": "Health", "PFE": "Health", "ABBV": "Health",
+    "MRK": "Health", "LLY": "Health", "TMO": "Health",
+    "WMT": "Consumer", "COST": "Consumer", "HD": "Consumer",
+    "NKE": "Consumer", "SBUX": "Consumer", "MCD": "Consumer", "DIS": "Consumer",
+    "F": "Consumer", "RIVN": "Consumer",
+    "XOM": "Energy", "CVX": "Energy", "COP": "Energy",
+    "SLB": "Energy", "EOG": "Energy",
+    "CAT": "Industrial", "DE": "Industrial", "BA": "Industrial",
+    "GE": "Industrial", "HON": "Industrial", "UNP": "Industrial",
+    "SPY": "ETF", "QQQ": "ETF", "IWM": "ETF", "XLF": "ETF",
+    "XLE": "ETF", "XLK": "ETF", "TQQQ": "ETF", "SOXL": "ETF",
+    "ARKK": "ETF", "VTI": "ETF", "VOO": "ETF", "DIA": "ETF",
+}
+
+# ── Support / Resistance ───────────────────────────────────
+SR_LOOKBACK = 20                # bars to detect swing highs/lows
+SR_RESISTANCE_BUFFER = 0.015    # penalize entries within 1.5% of resistance
+SR_SUPPORT_BONUS = 0            # no scoring bonus from S/R (used for info only)
+
+# ── Gap filter: avoid chasing exhaustion gaps ──────────────
+GAP_UP_MAX_PCT = 0.08           # skip if today gapped up > 8%
+
+# ── Dynamic threshold: adjust score bar by market quality ──
+DYNAMIC_THRESHOLD_ENABLED = False
+DYNAMIC_THRESHOLD_ADJUSTMENT = 1  # +/- this amount
+# In strong markets (SPY > EMA-50 and EMA-50 rising), lower threshold by 1
+# In weak/choppy markets the threshold stays at base (no increase)
 
 # ─────────────────────────────────────────────
 # Risk Management

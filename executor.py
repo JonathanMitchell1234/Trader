@@ -9,7 +9,7 @@ import datetime as dt
 
 import config
 from broker import AlpacaBroker
-from indicators import compute_all
+from indicators import compute_all, compute_weekly_trend, realized_volatility
 from pdt_guard import PDTGuard
 from risk_manager import RiskManager
 from screener import Screener
@@ -27,6 +27,8 @@ class TradeExecutor:
         self.pdt = PDTGuard()
         self.screener = Screener(self.broker)
         self._init_risk_manager()
+        self._sector_counts: dict[str, int] = {}
+        self._rebuild_sector_counts()
 
     def _init_risk_manager(self) -> None:
         equity = self.broker.get_equity()
@@ -43,6 +45,56 @@ class TradeExecutor:
     def refresh(self) -> None:
         """Refresh equity / position count before each cycle."""
         self._init_risk_manager()
+        self._rebuild_sector_counts()
+
+    def _rebuild_sector_counts(self) -> None:
+        """Rebuild sector exposure counts from current positions."""
+        self._sector_counts = {}
+        for pos in self.broker.get_positions():
+            sector = config.SECTOR_MAP.get(pos.symbol, "Other")
+            self._sector_counts[sector] = self._sector_counts.get(sector, 0) + 1
+
+    def _get_vol_regime_scale(self) -> float:
+        """Compute position-size scale factor from SPY realized vol."""
+        if not config.VOL_REGIME_ENABLED:
+            return 1.0
+        try:
+            spy_df = self.broker.get_bars(config.MARKET_REGIME_SYMBOL, limit=50)
+            if spy_df is None or len(spy_df) < config.REALIZED_VOL_WINDOW + 1:
+                return 1.0
+            vol = realized_volatility(spy_df, window=config.REALIZED_VOL_WINDOW)
+            if vol > config.HIGH_VOL_THRESHOLD:
+                return config.HIGH_VOL_SIZE_SCALE
+            if vol < config.LOW_VOL_THRESHOLD:
+                return config.LOW_VOL_SIZE_SCALE
+        except Exception as exc:
+            log.warning("Vol regime check failed: %s", exc)
+        return 1.0
+
+    def _get_dynamic_threshold(self, spy_df=None) -> int:
+        """Adjust entry score threshold based on market quality."""
+        base = config.ENTRY_SCORE_THRESHOLD
+        if not config.DYNAMIC_THRESHOLD_ENABLED:
+            return base
+        try:
+            if spy_df is None:
+                spy_df = self.broker.get_bars(config.MARKET_REGIME_SYMBOL, limit=250)
+            if spy_df is None or len(spy_df) < config.EMA_TREND + 5:
+                return base
+            spy_df = compute_all(spy_df)
+            row = spy_df.iloc[-1]
+            spy_close = row["close"]
+            spy_ema50 = row.get("ema_trend", None)
+            if spy_ema50 is None:
+                return base
+            if len(spy_df) >= config.EMA_SLOPE_PERIOD + 1:
+                ema50_ago = spy_df.iloc[-(config.EMA_SLOPE_PERIOD + 1)].get("ema_trend", None)
+                if ema50_ago is not None:
+                    if spy_close > spy_ema50 and spy_ema50 > ema50_ago:
+                        return base - 1  # strong market: lower bar
+        except Exception as exc:
+            log.warning("Dynamic threshold check failed: %s", exc)
+        return base
 
     # ─────────────────────────────────────────────────────────
     # EXIT SCAN – check existing positions for exit signals
@@ -146,16 +198,17 @@ class TradeExecutor:
     def scan_entries(self) -> int:
         """
         Screen the watchlist, evaluate entry signals, size positions,
-        and submit buy orders.
+        and submit buy orders. Uses v4 advanced filters.
         Returns the number of new positions opened.
         """
         self.refresh()
 
         if not self.risk.can_open_new_position():
-            log.info("Max positions reached – skipping entry scan")
+            log.info("Max positions reached - skipping entry scan")
             return 0
 
         # Market regime filter: don't open new longs in a bear market
+        spy_df = None
         if config.MARKET_REGIME_ENABLED:
             try:
                 spy_df = self.broker.get_bars(config.MARKET_REGIME_SYMBOL, limit=250)
@@ -165,15 +218,22 @@ class TradeExecutor:
                     spy_row = spy_df.iloc[-1]
                     spy_ema200 = spy_row.get("ema_200", None)
                     if spy_ema200 is not None and spy_row["close"] < spy_ema200:
-                        log.info("BEAR MARKET – %s below EMA-200, skipping entries",
+                        log.info("BEAR MARKET - %s below EMA-200, skipping entries",
                                  config.MARKET_REGIME_SYMBOL)
                         return 0
             except Exception as exc:
                 log.warning("Market regime check failed: %s", exc)
 
-        # Symbols we already hold – skip them
+        # Advanced features: vol regime + dynamic threshold
+        vol_scale = self._get_vol_regime_scale()
+        dyn_threshold = self._get_dynamic_threshold(spy_df)
+
+        if dyn_threshold != config.ENTRY_SCORE_THRESHOLD:
+            log.info("Dynamic threshold: %d (base %d)", dyn_threshold, config.ENTRY_SCORE_THRESHOLD)
+
+        # Symbols we already hold - skip them
         held = {p.symbol for p in self.broker.get_positions()}
-        # Symbols with pending buy orders – skip them too
+        # Symbols with pending buy orders - skip them too
         pending = {o.symbol for o in self.broker.get_open_orders() if o.side == "buy"}
 
         candidates = self.screener.screen()
@@ -190,8 +250,31 @@ class TradeExecutor:
             if not self.pdt.can_buy_today(symbol):
                 continue
 
-            signal = check_entry(c["df"])
+            # Sector exposure limit
+            sector = config.SECTOR_MAP.get(symbol, "Other")
+            if self._sector_counts.get(sector, 0) >= config.MAX_PER_SECTOR:
+                log.info("Sector %s full (%d/%d) - skipping %s",
+                         sector, self._sector_counts.get(sector, 0),
+                         config.MAX_PER_SECTOR, symbol)
+                continue
+
+            # Weekly trend check
+            weekly_bull = True
+            if config.WEEKLY_TREND_ENABLED:
+                try:
+                    df_full = c.get("df")
+                    if df_full is not None and len(df_full) > config.WEEKLY_EMA_SLOW * 5:
+                        wt = compute_weekly_trend(df_full)
+                        weekly_bull = wt["bullish"]
+                except Exception:
+                    pass
+
+            signal = check_entry(c["df"], weekly_bullish=weekly_bull)
             if signal is None:
+                continue
+
+            # Apply dynamic threshold manually (check_entry uses config default)
+            if signal["score"] < dyn_threshold:
                 continue
 
             entry_price = signal["price"]
@@ -204,6 +287,12 @@ class TradeExecutor:
                 stop_price=stop_loss,
                 buying_power=self.broker.get_buying_power(),
             )
+
+            # Apply volatility regime scaling
+            if vol_scale != 1.0 and qty > 0:
+                qty = round(qty * vol_scale, 3) if config.FRACTIONAL_SHARES else int(qty * vol_scale)
+                log.info("Vol regime scale: %.2f -> qty adjusted to %.3f", vol_scale, qty)
+
             if qty == 0:
                 log.info("Position size = 0 for %s - skipping", symbol)
                 continue
@@ -226,10 +315,12 @@ class TradeExecutor:
                 opened += 1
                 # Update counter so risk manager knows
                 self.risk.open_positions += 1
+                # Track sector
+                self._sector_counts[sector] = self._sector_counts.get(sector, 0) + 1
             except Exception as exc:
                 log.error("Buy order failed for %s: %s", symbol, exc)
 
-        log.info("Entry scan complete – opened %d position(s)", opened)
+        log.info("Entry scan complete - opened %d position(s)", opened)
         return opened
 
     # ─────────────────────────────────────────────────────────

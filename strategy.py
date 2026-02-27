@@ -1,12 +1,15 @@
 """
-Swing Trading Strategy v3 – Momentum + Scoring entries & smart exits.
+Swing Trading Strategy v4 – Advanced multi-factor scoring with smart exits.
 
-Builds on v2's scoring system with three major additions:
-  1. Momentum ranking — prefer stocks with strongest recent returns
-  2. Trend quality — require EMA-50 slope to be rising (not just price above it)
-  3. Dead-money exit — sell positions that haven't moved after N days
+Builds on v3 with six advanced features:
+  1. Multi-timeframe confirmation — weekly trend must agree (bonus/penalty)
+  2. Support/Resistance awareness — bonus near support, penalty near resistance
+  3. Gap-up avoidance — skip entries after >3% gap-ups (exhaustion risk)
+  4. Dynamic score threshold — adjusts by market quality
+  5. Volatility regime awareness — strategy adapts to vol conditions
+  6. Sector exposure limits — diversification enforcement
 
-Entry scoring (max ~14 points):
+Entry scoring (max ~20 points):
   +2  Price > EMA-50  (uptrend)
   +1  Price > EMA-200  (bull market regime on the stock itself)
   +2  EMA-9 just crossed above EMA-21  (bullish crossover)
@@ -18,10 +21,12 @@ Entry scoring (max ~14 points):
   +1  Price near lower Bollinger Band (<= BB mid)
   +1  Stochastic %K crossed above %D from oversold
   +2  Top-quartile momentum (20-day return)
+  +1  Weekly trend agrees (multi-TF confirmation)
+  +1  Price near support level
 
-  Threshold (configurable): 5
+  Threshold (configurable, dynamically adjusted): 5
 
-Exit criteria  (layered — not hair-trigger):
+Exit criteria  (layered - not hair-trigger):
   HARD exits (immediate):
     - Stop-loss / take-profit hit  (bracket order / ATR-based)
     - Price closes below EMA-200 AND below EMA-50  (trend destroyed)
@@ -32,8 +37,9 @@ Exit criteria  (layered — not hair-trigger):
     - MACD histogram negative for 2+ bars (accelerating down)
     - Price below EMA-50 (but still above 200)
     - Dead money: held N days with < 2% total move
+    - Momentum decay: -5% 20-day return + below EMA-50
 
-  Trailing stop handles the rest — lets winners run.
+  Trailing stop handles the rest - lets winners run.
 """
 
 from __future__ import annotations
@@ -49,10 +55,11 @@ log = get_logger("strategy")
 # ─────────────────────────────────────────────
 # ENTRY  (scoring system)
 # ─────────────────────────────────────────────
-def score_entry(df: pd.DataFrame) -> tuple[int, list[str]]:
+def score_entry(df: pd.DataFrame, weekly_bullish: bool = True) -> tuple[int, list[str]]:
     """
     Score the latest bar for entry quality.
     Returns (score, [list of contributing factors]).
+    weekly_bullish: whether the weekly trend is aligned (from caller).
     """
     if len(df) < max(config.MOMENTUM_LOOKBACK + 1, config.EMA_SLOPE_PERIOD + 1, 3):
         return 0, []
@@ -77,6 +84,14 @@ def score_entry(df: pd.DataFrame) -> tuple[int, list[str]]:
 
     if pd.isna(rsi) or pd.isna(atr) or pd.isna(adx):
         return 0, []
+
+    # ── Gap-up filter: skip entries after exhaustion gaps ────
+    prev_close = prv["close"]
+    today_open = cur["open"]
+    if prev_close > 0 and today_open > 0:
+        gap_pct = (today_open - prev_close) / prev_close
+        if gap_pct > config.GAP_UP_MAX_PCT:
+            return 0, [f"Gap-up {gap_pct*100:.1f}% (skipped)"]
 
     score = 0
     factors = []
@@ -146,6 +161,26 @@ def score_entry(df: pd.DataFrame) -> tuple[int, list[str]]:
                 score += 1
                 factors.append("Stoch bullish cross")
 
+    # +1: Weekly trend agrees (multi-timeframe)
+    if config.WEEKLY_TREND_ENABLED and weekly_bullish:
+        score += config.WEEKLY_TREND_BONUS
+        factors.append("Weekly trend OK")
+
+    # +1: Price near support / -penalty near resistance (only below EMA-50)
+    sr_support = cur.get("sr_support", None)
+    sr_resistance = cur.get("sr_resistance", None)
+    if sr_support is not None and not pd.isna(sr_support):
+        dist_to_support = (price - sr_support) / price if price > 0 else 1.0
+        if dist_to_support <= 0.03:  # within 3% of support
+            score += config.SR_SUPPORT_BONUS
+            factors.append("Near support")
+    if sr_resistance is not None and not pd.isna(sr_resistance):
+        dist_to_resistance = (sr_resistance - price) / price if price > 0 else 1.0
+        # Only penalize near resistance if stock is BELOW EMA-50 (overhead resistance)
+        if dist_to_resistance <= config.SR_RESISTANCE_BUFFER and price < ema_trend:
+            score -= 1
+            factors.append("Near resistance (-1)")
+
     return score, factors
 
 
@@ -167,12 +202,12 @@ def compute_momentum(df: pd.DataFrame) -> float:
     return (cur_close - past_close) / past_close
 
 
-def check_entry(df: pd.DataFrame) -> dict | None:
+def check_entry(df: pd.DataFrame, weekly_bullish: bool = True) -> dict | None:
     """
     Evaluate the latest bar using the scoring system.
     Return a signal dict if score meets threshold, else None.
     """
-    score, factors = score_entry(df)
+    score, factors = score_entry(df, weekly_bullish=weekly_bullish)
 
     if score < config.ENTRY_SCORE_THRESHOLD:
         return None
