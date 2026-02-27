@@ -1,0 +1,142 @@
+"""
+Swing Trading Bot – Main Entry Point
+
+Usage:
+    python main.py              # run continuously during market hours
+    python main.py --once       # run a single cycle and exit
+    python main.py --status     # print account & position status
+    python main.py --backtest   # run backtest (pass-through to backtest.py)
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import sys
+import time
+
+import schedule
+
+import config
+from broker import AlpacaBroker
+from executor import TradeExecutor
+from logger import get_logger
+
+log = get_logger("main")
+
+
+def print_status() -> None:
+    """Print a quick account & positions summary."""
+    broker = AlpacaBroker()
+    acct = broker.get_account()
+    positions = broker.get_positions()
+    clock = broker.get_clock()
+
+    print("\n" + "=" * 60)
+    print("  SWING TRADING BOT – STATUS")
+    print("=" * 60)
+    print(f"  Mode           : {config.TRADING_MODE.upper()}")
+    print(f"  Market open    : {clock.is_open}")
+    print(f"  Next open      : {clock.next_open}")
+    print(f"  Next close     : {clock.next_close}")
+    print(f"  Equity         : ${float(acct.equity):>12,.2f}")
+    print(f"  Cash           : ${float(acct.cash):>12,.2f}")
+    print(f"  Buying power   : ${float(acct.buying_power):>12,.2f}")
+    print(f"  Day-trade count: {acct.daytrade_count}")
+    print(f"  Open positions : {len(positions)}")
+    print("-" * 60)
+
+    if positions:
+        print(f"  {'Symbol':<8} {'Qty':>6} {'Entry':>10} {'Current':>10} {'P&L':>10} {'P&L%':>8}")
+        print("  " + "-" * 54)
+        for p in positions:
+            sym = p.symbol
+            qty = int(p.qty)
+            entry = float(p.avg_entry_price)
+            cur = float(p.current_price)
+            pnl = float(p.unrealized_pl)
+            pnl_pct = float(p.unrealized_plpc) * 100
+            print(f"  {sym:<8} {qty:>6} {entry:>10.2f} {cur:>10.2f} {pnl:>+10.2f} {pnl_pct:>+7.2f}%")
+    else:
+        print("  (no open positions)")
+
+    print("=" * 60 + "\n")
+
+
+def run_once() -> None:
+    """Run a single scan cycle."""
+    log.info("Running single cycle...")
+    executor = TradeExecutor()
+    executor.run_cycle()
+    log.info("Single cycle complete.")
+
+
+def run_loop() -> None:
+    """
+    Run the bot in a continuous loop using `schedule`.
+    - Exits are checked more frequently (every 15 min)
+    - Full entry scans happen every 30 min
+    """
+    log.info("=" * 60)
+    log.info("  SWING TRADING BOT STARTED")
+    log.info("  Mode: %s", config.TRADING_MODE.upper())
+    log.info("  Watchlist: %d symbols", len(config.WATCHLIST))
+    log.info("  Entry scan every %d min", config.SCAN_INTERVAL_MINUTES)
+    log.info("  Exit check every %d min", config.CHECK_EXITS_MINUTES)
+    log.info("=" * 60)
+
+    executor = TradeExecutor()
+
+    def exit_check():
+        if executor.broker.is_market_open():
+            executor.refresh()
+            executor.scan_exits()
+
+    def full_cycle():
+        executor.run_cycle()
+
+    # Schedule jobs
+    schedule.every(config.CHECK_EXITS_MINUTES).minutes.do(exit_check)
+    schedule.every(config.SCAN_INTERVAL_MINUTES).minutes.do(full_cycle)
+
+    # Run the first cycle immediately
+    full_cycle()
+
+    # Keep running
+    while True:
+        schedule.run_pending()
+        time.sleep(30)  # sleep 30s between scheduler ticks
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Swing Trading Bot (Alpaca)")
+    parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
+    parser.add_argument("--status", action="store_true", help="Print account status")
+    parser.add_argument("--backtest", action="store_true", help="Run backtester")
+    parser.add_argument("--symbols", nargs="+", default=None, help="Symbols for backtest")
+    parser.add_argument("--months", type=int, default=12, help="Backtest lookback months")
+    args = parser.parse_args()
+
+    if not config.ALPACA_API_KEY or config.ALPACA_API_KEY == "your_api_key_here":
+        print("\n  ERROR: Set your Alpaca API keys in .env (see .env.example)\n")
+        sys.exit(1)
+
+    if args.backtest:
+        from backtest import Backtester
+        import datetime as _dt
+        symbols = args.symbols or ["SPY"]
+        end = _dt.date.today()
+        start = end - _dt.timedelta(days=args.months * 30)
+        bt = Backtester(symbols=symbols, start_date=start, end_date=end)
+        bt.run()
+        bt.save_chart()
+    elif args.status:
+        print_status()
+    elif args.once:
+        run_once()
+    else:
+        run_loop()
+
+
+if __name__ == "__main__":
+    main()

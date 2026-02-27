@@ -1,0 +1,290 @@
+"""
+Swing Trading Strategy v3 – Momentum + Scoring entries & smart exits.
+
+Builds on v2's scoring system with three major additions:
+  1. Momentum ranking — prefer stocks with strongest recent returns
+  2. Trend quality — require EMA-50 slope to be rising (not just price above it)
+  3. Dead-money exit — sell positions that haven't moved after N days
+
+Entry scoring (max ~14 points):
+  +2  Price > EMA-50  (uptrend)
+  +1  Price > EMA-200  (bull market regime on the stock itself)
+  +2  EMA-9 just crossed above EMA-21  (bullish crossover)
+  +1  EMA-50 slope is rising (trend quality)
+  +2  RSI in 30-50 zone  (pullback, not overbought)
+  +1  MACD histogram positive or turning up
+  +1  Volume >= average
+  +1  ADX > 20  (trending)
+  +1  Price near lower Bollinger Band (<= BB mid)
+  +1  Stochastic %K crossed above %D from oversold
+  +2  Top-quartile momentum (20-day return)
+
+  Threshold (configurable): 5
+
+Exit criteria  (layered — not hair-trigger):
+  HARD exits (immediate):
+    - Stop-loss / take-profit hit  (bracket order / ATR-based)
+    - Price closes below EMA-200 AND below EMA-50  (trend destroyed)
+
+  SOFT exits (need 2+ signals to trigger):
+    - RSI >= 80 (truly overbought)
+    - Bearish EMA-9/21 crossover
+    - MACD histogram negative for 2+ bars (accelerating down)
+    - Price below EMA-50 (but still above 200)
+    - Dead money: held N days with < 2% total move
+
+  Trailing stop handles the rest — lets winners run.
+"""
+
+from __future__ import annotations
+
+import pandas as pd
+
+import config
+from logger import get_logger
+
+log = get_logger("strategy")
+
+
+# ─────────────────────────────────────────────
+# ENTRY  (scoring system)
+# ─────────────────────────────────────────────
+def score_entry(df: pd.DataFrame) -> tuple[int, list[str]]:
+    """
+    Score the latest bar for entry quality.
+    Returns (score, [list of contributing factors]).
+    """
+    if len(df) < max(config.MOMENTUM_LOOKBACK + 1, config.EMA_SLOPE_PERIOD + 1, 3):
+        return 0, []
+
+    cur = df.iloc[-1]
+    prv = df.iloc[-2]
+
+    price = cur["close"]
+    ema_fast = cur["ema_fast"]
+    ema_slow = cur["ema_slow"]
+    ema_trend = cur["ema_trend"]
+    ema_200 = cur.get("ema_200", None)
+    rsi = cur["rsi"]
+    macd_hist = cur["macd_hist"]
+    adx = cur["adx"]
+    vol_ratio = cur["vol_ratio"]
+    atr = cur["atr"]
+    bb_lower = cur.get("bb_lower", None)
+    bb_mid = cur.get("bb_mid", None)
+    stoch_k = cur.get("stoch_k", None)
+    stoch_d = cur.get("stoch_d", None)
+
+    if pd.isna(rsi) or pd.isna(atr) or pd.isna(adx):
+        return 0, []
+
+    score = 0
+    factors = []
+
+    # +2: Price above 50-EMA (core uptrend)
+    if price > ema_trend:
+        score += 2
+        factors.append("Above EMA-50")
+
+    # +1: Price above 200-EMA (bull regime)
+    if ema_200 is not None and not pd.isna(ema_200) and price > ema_200:
+        score += 1
+        factors.append("Above EMA-200")
+
+    # +2: Bullish EMA crossover (9 crosses above 21)
+    if (prv["ema_fast"] <= prv["ema_slow"]) and (ema_fast > ema_slow):
+        score += 2
+        factors.append("EMA crossover")
+
+    # +1: Trend quality — EMA-50 slope is rising
+    if len(df) >= config.EMA_SLOPE_PERIOD + 1:
+        ema50_now = cur["ema_trend"]
+        ema50_ago = df.iloc[-(config.EMA_SLOPE_PERIOD + 1)]["ema_trend"]
+        if not pd.isna(ema50_now) and not pd.isna(ema50_ago) and ema50_now > ema50_ago:
+            score += 1
+            factors.append("EMA-50 rising")
+
+    # +2: RSI in pullback zone (30-50)
+    if config.RSI_OVERSOLD <= rsi <= 50:
+        score += 2
+        factors.append(f"RSI pullback ({rsi:.0f})")
+    elif 50 < rsi <= 60:
+        score += 1
+        factors.append(f"RSI mid-range ({rsi:.0f})")
+
+    # +1: MACD histogram positive or turning up
+    macd_ok = macd_hist > 0 or (
+        prv["macd_hist"] < 0 and macd_hist > prv["macd_hist"]
+    )
+    if macd_ok:
+        score += 1
+        factors.append("MACD positive/turning")
+
+    # +1: Volume above average
+    if vol_ratio >= config.VOLUME_SURGE_FACTOR:
+        score += 1
+        factors.append(f"Volume {vol_ratio:.1f}x")
+
+    # +1: ADX showing trend
+    if adx > 20:
+        score += 1
+        factors.append(f"ADX {adx:.0f}")
+
+    # +1: Price near lower Bollinger Band
+    if bb_mid is not None and not pd.isna(bb_mid) and price <= bb_mid:
+        score += 1
+        factors.append("Near BB lower")
+
+    # +1: Stochastic bullish crossover from oversold
+    if (stoch_k is not None and stoch_d is not None
+            and not pd.isna(stoch_k) and not pd.isna(stoch_d)):
+        prv_stoch_k = prv.get("stoch_k", None)
+        prv_stoch_d = prv.get("stoch_d", None)
+        if (prv_stoch_k is not None and prv_stoch_d is not None
+                and not pd.isna(prv_stoch_k) and not pd.isna(prv_stoch_d)):
+            if prv_stoch_k <= prv_stoch_d and stoch_k > stoch_d and stoch_k < 50:
+                score += 1
+                factors.append("Stoch bullish cross")
+
+    return score, factors
+
+
+def compute_momentum(df: pd.DataFrame) -> float:
+    """
+    Compute the momentum (rate of change) over the lookback period.
+    Returns the % change as a decimal (e.g. 0.05 = +5%).
+    """
+    lookback = config.MOMENTUM_LOOKBACK
+    if len(df) < lookback + 1:
+        return 0.0
+
+    cur_close = df.iloc[-1]["close"]
+    past_close = df.iloc[-(lookback + 1)]["close"]
+
+    if past_close <= 0 or pd.isna(past_close) or pd.isna(cur_close):
+        return 0.0
+
+    return (cur_close - past_close) / past_close
+
+
+def check_entry(df: pd.DataFrame) -> dict | None:
+    """
+    Evaluate the latest bar using the scoring system.
+    Return a signal dict if score meets threshold, else None.
+    """
+    score, factors = score_entry(df)
+
+    if score < config.ENTRY_SCORE_THRESHOLD:
+        return None
+
+    cur = df.iloc[-1]
+    price = cur["close"]
+    atr = cur["atr"]
+
+    reason = f"Score {score}: {', '.join(factors)}"
+
+    signal = {
+        "action": "BUY",
+        "price": price,
+        "atr": atr,
+        "rsi": cur["rsi"],
+        "macd_hist": cur["macd_hist"],
+        "adx": cur["adx"],
+        "vol_ratio": cur["vol_ratio"],
+        "score": score,
+        "reason": reason,
+    }
+    log.info("ENTRY signal: price=%.2f  %s", price, reason)
+    return signal
+
+
+# ─────────────────────────────────────────────
+# EXIT  (layered – hard + soft)
+# ─────────────────────────────────────────────
+def check_exit(df: pd.DataFrame, entry_price: float = 0.0,
+               hold_days: int = 0) -> dict | None:
+    """
+    Evaluate whether an existing position should be closed.
+
+    HARD exits fire immediately (1 is enough).
+    SOFT exits require 2+ simultaneous signals to avoid
+    getting shaken out by normal volatility.
+    """
+    if len(df) < 4:
+        return None
+
+    cur = df.iloc[-1]
+    prv = df.iloc[-2]
+
+    price = cur["close"]
+    ema_fast = cur["ema_fast"]
+    ema_slow = cur["ema_slow"]
+    ema_trend = cur["ema_trend"]
+    ema_200 = cur.get("ema_200", None)
+    rsi = cur["rsi"]
+    macd_hist = cur["macd_hist"]
+
+    if pd.isna(rsi):
+        return None
+
+    hard_reasons = []
+    soft_reasons = []
+
+    # ── HARD: price below BOTH EMA-50 and EMA-200 (trend destroyed) ──
+    if ema_200 is not None and not pd.isna(ema_200):
+        if price < ema_trend and price < ema_200:
+            hard_reasons.append("Below EMA-50 & EMA-200")
+
+    # ── SOFT: RSI extremely overbought ───────────────────────
+    if rsi >= config.RSI_OVERBOUGHT:
+        soft_reasons.append(f"RSI overbought ({rsi:.1f})")
+
+    # ── SOFT: Bearish EMA crossover ──────────────────────────
+    if (prv["ema_fast"] >= prv["ema_slow"]) and (ema_fast < ema_slow):
+        soft_reasons.append("Bearish EMA crossover")
+
+    # ── SOFT: MACD histogram declining for 2+ bars ───────────
+    if (prv["macd_hist"] < 0 and macd_hist < 0
+            and macd_hist < prv["macd_hist"]):
+        soft_reasons.append("MACD declining 2+ bars")
+
+    # ── SOFT: price below EMA-50 (but still above 200) ──────
+    if price < ema_trend:
+        if ema_200 is None or pd.isna(ema_200) or price >= ema_200:
+            soft_reasons.append(f"Price below EMA-{config.EMA_TREND}")
+
+    # ── SOFT: Dead money — position is flat after N days ─────
+    if (entry_price > 0 and hold_days >= config.DEAD_MONEY_DAYS):
+        move_pct = abs(price - entry_price) / entry_price
+        if move_pct < config.DEAD_MONEY_THRESHOLD:
+            soft_reasons.append(
+                f"Dead money ({hold_days}d, {move_pct*100:.1f}% move)"
+            )
+
+    # ── SOFT: Momentum decay — 20-day return turned negative ─
+    if len(df) >= config.MOMENTUM_LOOKBACK + 1:
+        past_price = df.iloc[-(config.MOMENTUM_LOOKBACK + 1)]["close"]
+        if not pd.isna(past_price) and past_price > 0:
+            mom = (price - past_price) / past_price
+            if mom < -0.05 and price < ema_trend:
+                soft_reasons.append(f"Momentum decay ({mom*100:.1f}%)")
+
+    # ── Decision: hard fires immediately, soft needs 2+ ──────
+    reasons = []
+    if hard_reasons:
+        reasons = hard_reasons
+    elif len(soft_reasons) >= 2:
+        reasons = soft_reasons
+
+    if not reasons:
+        return None
+
+    signal = {
+        "action": "SELL",
+        "price": price,
+        "rsi": rsi,
+        "macd_hist": macd_hist,
+        "reasons": reasons,
+    }
+    log.info("EXIT  signal: price=%.2f  reasons=%s", price, ", ".join(reasons))
+    return signal
