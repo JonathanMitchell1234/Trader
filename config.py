@@ -83,9 +83,35 @@ DEAD_MONEY_THRESHOLD = 0.02     # has moved less than 2% total
 RE_ENTRY_COOLDOWN_DAYS = 5
 
 # ── Market regime filter (SPY-based) ────────────────────────
-MARKET_REGIME_ENABLED = True   # reject new buys in bear markets
+MARKET_REGIME_ENABLED = True   # classify bull/bear regime from market proxy
 MARKET_REGIME_SYMBOL = "SPY"   # index proxy
-# Bull = SPY above its 200-EMA; Bear = below
+# Bull/Bear regime confirmation (reduces whipsaws)
+MARKET_REGIME_CONFIRM_DAYS = 4
+MARKET_REGIME_EMA_BUFFER = 0.005  # 0.5% buffer around EMA-200
+BEAR_REGIME_DRAWDOWN_LOOKBACK = 252
+BEAR_REGIME_DRAWDOWN_TRIGGER = 0.25  # require >=25% drawdown from recent high
+
+# Bear-mode strategy (long-only, no shorting)
+BEAR_STRATEGY_ENABLED = True
+BEAR_ENTRY_SCORE_THRESHOLD = 6
+BEAR_ATR_STOP_MULTIPLIER = 1.8
+BEAR_ATR_PROFIT_MULTIPLIER = 3.2
+BEAR_RSI_OVERBOUGHT_EXIT = 75
+BEAR_DEAD_MONEY_DAYS = 6
+BEAR_DEAD_MONEY_THRESHOLD = 0.015
+BEAR_MAX_POSITION_SCALE = 0.85
+BEAR_MAX_POSITIONS_CAP = 2
+
+# Instruments used when the market is in bear regime.
+# Prefer inverse/defensive ETFs so we can stay long-only and PDT-safe.
+BEAR_WATCHLIST = [
+    "SH", "SDS", "SPXU",  # inverse S&P 500
+    "PSQ", "SQQQ",         # inverse Nasdaq 100
+    "DOG",                   # inverse Dow
+    "SOXS",                  # inverse semiconductors
+    "XLE", "XLP", "XLU",  # defensive/relative-strength sectors
+    "GLD", "TLT",           # risk-off assets
+]
 
 # ── Multi-timeframe confirmation (weekly trend) ────────────
 WEEKLY_TREND_ENABLED = False    # disabled for small accounts (blocks momentum plays)
@@ -155,6 +181,12 @@ TRAILING_STOP_PCT = 0.04          # 4% trailing stop on winners
 # ── Adaptive stop: tighten trailing stop as profit grows ─────
 TRAILING_STOP_TIGHT_ACTIVATE = 0.15  # above 15% profit, tighten
 TRAILING_STOP_TIGHT_PCT = 0.03       # to 3% trailing stop
+
+# ── Bear-mode trailing stops (faster de-risking) ────────────
+BEAR_TRAILING_STOP_ACTIVATE_PCT = 0.04
+BEAR_TRAILING_STOP_PCT = 0.03
+BEAR_TRAILING_STOP_TIGHT_ACTIVATE = 0.10
+BEAR_TRAILING_STOP_TIGHT_PCT = 0.02
 
 # ── Small-account overrides (auto-applied when equity < SMALL_ACCOUNT_THRESHOLD)
 SMALL_MAX_OPEN_POSITIONS = 3       # concentrate with tiny capital

@@ -34,6 +34,11 @@ import pandas as pd
 import config
 from indicators import compute_all, compute_weekly_trend, realized_volatility
 from logger import get_logger
+from strategy import (
+    check_entry as strategy_check_entry,
+    check_exit as strategy_check_exit,
+    classify_market_regime,
+)
 
 log = get_logger("backtest")
 
@@ -84,6 +89,7 @@ class Position:
     qty: float
     stop_loss: float
     take_profit: float
+    regime: str = "bull"
     highest_price: float = 0.0   # for trailing stop tracking
 
     def __post_init__(self):
@@ -107,7 +113,17 @@ class Backtester:
         end_date: dt.date,
         initial_capital: float = 100_000.0,
     ) -> None:
-        self.symbols = symbols
+        self._bull_entry_symbols = list(dict.fromkeys(symbols))
+        self._bear_entry_symbols = (
+            list(dict.fromkeys(config.BEAR_WATCHLIST))
+            if config.BEAR_STRATEGY_ENABLED
+            else []
+        )
+        self.symbols = self._bull_entry_symbols.copy()
+        for symbol in self._bear_entry_symbols:
+            if symbol not in self.symbols:
+                self.symbols.append(symbol)
+
         self.start_date = start_date
         self.end_date = end_date
         self.initial_capital = initial_capital
@@ -124,6 +140,7 @@ class Backtester:
 
         # Market-regime data (SPY EMA-200)
         self._regime_data: Optional[pd.DataFrame] = None
+        self._last_regime = "bull"
 
         # Cooldown tracker: symbol → last exit date
         self._cooldowns: Dict[str, dt.date] = {}
@@ -271,18 +288,37 @@ class Backtester:
         return max(0, math.floor(qty_raw))
 
     # ── market regime check ──────────────────────────────────
-    def _is_bull_market(self, date: dt.date) -> bool:
-        """Check if SPY is above its 200-EMA (bull market)."""
+    def _market_regime(self, date: dt.date) -> str:
+        """Return active regime (bull/bear) using hysteresis confirmation."""
         if not config.MARKET_REGIME_ENABLED or self._regime_data is None:
-            return True  # default: allow trades
+            return "bull"
+
         mask = self._regime_data.index.date <= date
         if not mask.any():
-            return True
-        row = self._regime_data.loc[mask].iloc[-1]
-        ema_200 = row.get("ema_200", None)
-        if ema_200 is None or pd.isna(ema_200):
-            return True
-        return row["close"] > ema_200
+            return self._last_regime
+
+        subset = self._regime_data.loc[mask]
+        self._last_regime = classify_market_regime(subset, last_regime=self._last_regime)
+        return self._last_regime
+
+    def _is_bull_market(self, date: dt.date) -> bool:
+        return self._market_regime(date) == "bull"
+
+    def _trailing_params(self, regime: str) -> tuple[float, float, float, float]:
+        """Return trailing-stop parameters for bull or bear mode."""
+        if regime == "bear":
+            return (
+                config.BEAR_TRAILING_STOP_ACTIVATE_PCT,
+                config.BEAR_TRAILING_STOP_PCT,
+                config.BEAR_TRAILING_STOP_TIGHT_ACTIVATE,
+                config.BEAR_TRAILING_STOP_TIGHT_PCT,
+            )
+        return (
+            config.TRAILING_STOP_ACTIVATE_PCT,
+            config.TRAILING_STOP_PCT,
+            config.TRAILING_STOP_TIGHT_ACTIVATE,
+            config.TRAILING_STOP_TIGHT_PCT,
+        )
 
     # ── momentum helper ──────────────────────────────────────
     def _compute_momentum(self, symbol: str, date: dt.date) -> float:
@@ -385,8 +421,19 @@ class Backtester:
     # ── strategy evaluation (v4 scoring + advanced filters) ──
     def _check_entry(self, df: pd.DataFrame, momentum: float = 0.0,
                       weekly_bullish: bool = True,
-                      score_threshold: int = 0) -> Optional[dict]:
-        """Scoring-based entry system with momentum bonus + v4 advanced filters."""
+                      score_threshold: int = 0,
+                      regime: str = "bull") -> Optional[dict]:
+        """Scoring-based entry system with momentum bonus + regime branch."""
+        if regime == "bear":
+            threshold = score_threshold if score_threshold > 0 else config.BEAR_ENTRY_SCORE_THRESHOLD
+            return strategy_check_entry(
+                df,
+                weekly_bullish=weekly_bullish,
+                regime="bear",
+                momentum=momentum,
+                score_threshold=threshold,
+            )
+
         if len(df) < max(config.MOMENTUM_LOOKBACK + 1, config.EMA_SLOPE_PERIOD + 1, 3):
             return None
 
@@ -410,7 +457,6 @@ class Backtester:
         if pd.isna(rsi) or pd.isna(atr) or pd.isna(adx):
             return None
 
-        # ── Gap-up filter: skip exhaustion gaps ──────────────
         prev_close = prv["close"]
         today_open = cur["open"]
         if prev_close > 0 and today_open > 0:
@@ -421,22 +467,18 @@ class Backtester:
         score = 0
         factors = []
 
-        # +2: Price above EMA-50
         if price > ema_trend:
             score += 2
             factors.append("Above EMA-50")
 
-        # +1: Price above EMA-200
         if ema_200 is not None and not pd.isna(ema_200) and price > ema_200:
             score += 1
             factors.append("Above EMA-200")
 
-        # +2: Bullish EMA crossover
         if (prv["ema_fast"] <= prv["ema_slow"]) and (ema_fast > ema_slow):
             score += 2
             factors.append("EMA crossover")
 
-        # +1: Trend quality - EMA-50 slope is rising
         if len(df) >= config.EMA_SLOPE_PERIOD + 1:
             ema50_now = cur["ema_trend"]
             ema50_ago = df.iloc[-(config.EMA_SLOPE_PERIOD + 1)]["ema_trend"]
@@ -444,7 +486,6 @@ class Backtester:
                 score += 1
                 factors.append("EMA-50 rising")
 
-        # +2: RSI in pullback zone (30-50)
         if config.RSI_OVERSOLD <= rsi <= 50:
             score += 2
             factors.append(f"RSI pullback ({rsi:.0f})")
@@ -452,7 +493,6 @@ class Backtester:
             score += 1
             factors.append(f"RSI mid-range ({rsi:.0f})")
 
-        # +1: MACD positive or turning
         macd_ok = macd_hist > 0 or (
             prv["macd_hist"] < 0 and macd_hist > prv["macd_hist"]
         )
@@ -460,22 +500,18 @@ class Backtester:
             score += 1
             factors.append("MACD+")
 
-        # +1: Volume above average
         if vol_ratio >= config.VOLUME_SURGE_FACTOR:
             score += 1
             factors.append(f"Vol {vol_ratio:.1f}x")
 
-        # +1: ADX
         if adx > 20:
             score += 1
             factors.append(f"ADX {adx:.0f}")
 
-        # +1: Near lower BB
         if bb_mid is not None and not pd.isna(bb_mid) and price <= bb_mid:
             score += 1
             factors.append("Near BB lower")
 
-        # +1: Stochastic bullish crossover
         if (stoch_k is not None and stoch_d is not None
                 and not pd.isna(stoch_k) and not pd.isna(stoch_d)):
             prv_sk = prv.get("stoch_k", None)
@@ -486,20 +522,17 @@ class Backtester:
                     score += 1
                     factors.append("Stoch cross")
 
-        # +2: Top-quartile momentum bonus
-        if momentum > 0.05:  # > 5% in lookback period
+        if momentum > 0.05:
             score += config.MOMENTUM_SCORE_WEIGHT
             factors.append(f"Momentum +{momentum*100:.0f}%")
-        elif momentum > 0.02:  # moderate momentum
+        elif momentum > 0.02:
             score += 1
             factors.append(f"Momentum +{momentum*100:.0f}%")
 
-        # +1: Weekly trend agrees (multi-timeframe)
         if config.WEEKLY_TREND_ENABLED and weekly_bullish:
             score += config.WEEKLY_TREND_BONUS
             factors.append("Weekly trend OK")
 
-        # +1/-1: Support / Resistance awareness
         sr_support = cur.get("sr_support", None)
         sr_resistance = cur.get("sr_resistance", None)
         if sr_support is not None and not pd.isna(sr_support) and price > 0:
@@ -509,7 +542,6 @@ class Backtester:
                 factors.append("Near support")
         if sr_resistance is not None and not pd.isna(sr_resistance) and price > 0:
             dist_to_resistance = (sr_resistance - price) / price
-            # Only penalize near resistance if stock is BELOW EMA-50 (overhead resistance)
             if dist_to_resistance <= config.SR_RESISTANCE_BUFFER and price < ema_trend:
                 score -= 1
                 factors.append("Near resistance (-1)")
@@ -526,8 +558,18 @@ class Backtester:
         }
 
     def _check_exit(self, df: pd.DataFrame, entry_price: float = 0.0,
-                    hold_days: int = 0) -> Optional[List[str]]:
-        """Layered exit: hard exits fire immediately, soft exits need 2+ signals."""
+                    hold_days: int = 0,
+                    regime: str = "bull") -> Optional[List[str]]:
+        """Layered exit: original bull logic + bear-mode branch."""
+        if regime == "bear":
+            signal = strategy_check_exit(
+                df,
+                entry_price=entry_price,
+                hold_days=hold_days,
+                regime="bear",
+            )
+            return signal["reasons"] if signal is not None else None
+
         if len(df) < 4:
             return None
 
@@ -548,37 +590,30 @@ class Backtester:
         hard_reasons = []
         soft_reasons = []
 
-        # HARD: price below BOTH EMA-50 and EMA-200
         if ema_200 is not None and not pd.isna(ema_200):
             if price < ema_trend and price < ema_200:
                 hard_reasons.append("Below EMA-50 & EMA-200")
 
-        # SOFT: RSI extremely overbought
         if rsi >= config.RSI_OVERBOUGHT:
             soft_reasons.append(f"RSI overbought ({rsi:.1f})")
 
-        # SOFT: Bearish EMA crossover
         if (prv["ema_fast"] >= prv["ema_slow"]) and (ema_fast < ema_slow):
             soft_reasons.append("Bearish EMA crossover")
 
-        # SOFT: MACD declining for 2+ bars
         if (prv["macd_hist"] < 0 and macd_hist < 0
                 and macd_hist < prv["macd_hist"]):
             soft_reasons.append("MACD declining 2+ bars")
 
-        # SOFT: price below EMA-50 (but still above 200)
         if price < ema_trend:
             if ema_200 is None or pd.isna(ema_200) or price >= ema_200:
                 soft_reasons.append(f"Price below EMA-{config.EMA_TREND}")
 
-        # SOFT: Dead money — position hasn't moved in N days
         if entry_price > 0 and hold_days >= config.DEAD_MONEY_DAYS:
             move_pct = abs(price - entry_price) / entry_price
             if move_pct < config.DEAD_MONEY_THRESHOLD:
                 soft_reasons.append(
                     f"Dead money ({hold_days}d, {move_pct*100:.1f}% move)")
 
-        # SOFT: Momentum decay — 20-day return is strongly negative + below EMA-50
         if len(df) >= config.MOMENTUM_LOOKBACK + 1:
             past_price = df.iloc[-(config.MOMENTUM_LOOKBACK + 1)]["close"]
             if not pd.isna(past_price) and past_price > 0:
@@ -636,6 +671,8 @@ class Backtester:
     def _process_day(self, date: dt.date) -> None:
         """Process a single day: check stops -> check exits -> check entries."""
 
+        market_regime = self._market_regime(date)
+
         # 1. Check stop-loss and take-profit on open positions
         for symbol in list(self.positions.keys()):
             pos = self.positions[symbol]
@@ -663,11 +700,18 @@ class Backtester:
                 continue
 
             # Adaptive trailing stop: tighter as profit grows
+            trailing_mode = pos.regime
+            (
+                trail_activate,
+                trail_pct_normal,
+                trail_tight_activate,
+                trail_pct_tight,
+            ) = self._trailing_params(trailing_mode)
             profit_pct = (pos.highest_price - pos.entry_price) / pos.entry_price
-            if profit_pct >= config.TRAILING_STOP_TIGHT_ACTIVATE:
-                trail_pct = config.TRAILING_STOP_TIGHT_PCT
-            elif profit_pct >= config.TRAILING_STOP_ACTIVATE_PCT:
-                trail_pct = config.TRAILING_STOP_PCT
+            if profit_pct >= trail_tight_activate:
+                trail_pct = trail_pct_tight
+            elif profit_pct >= trail_activate:
+                trail_pct = trail_pct_normal
             else:
                 trail_pct = None
 
@@ -696,24 +740,44 @@ class Backtester:
             if df is None:
                 continue
 
+            exit_regime = pos.regime
             reasons = self._check_exit(df, entry_price=pos.entry_price,
-                                       hold_days=hold_days)
+                                       hold_days=hold_days,
+                                       regime=exit_regime)
             if reasons:
                 self._close_position(symbol, date, "; ".join(reasons))
 
         # 3. Scan for new entries (respect market regime + momentum ranking + v4 filters)
-        bull_market = self._is_bull_market(date)
         equity = self._portfolio_value(date)
         max_positions = config.get_max_positions(equity)
+        bear_symbol_set = set(self._bear_entry_symbols)
+        if market_regime == "risk_off":
+            self.equity_curve.append((date, equity))
+            return
+
+        if market_regime == "bear":
+            if not config.BEAR_STRATEGY_ENABLED:
+                equity = self._portfolio_value(date)
+                self.equity_curve.append((date, equity))
+                return
+
         atr_stop_mult = config.get_atr_stop_mult(equity)
         atr_profit_mult = config.get_atr_profit_mult(equity)
-        vol_scale = self._vol_regime_scale(date)
-        dyn_threshold = self._dynamic_score_threshold(date)
+        vol_scale = self._vol_regime_scale(date) if market_regime == "bull" else 1.0
+        dyn_threshold = (
+            self._dynamic_score_threshold(date)
+            if market_regime == "bull"
+            else config.BEAR_ENTRY_SCORE_THRESHOLD
+        )
+        if market_regime == "bull":
+            entry_universe = self._bull_entry_symbols
+        else:
+            entry_universe = list(dict.fromkeys(self._bull_entry_symbols + self._bear_entry_symbols))
 
-        if len(self.positions) < max_positions and bull_market:
+        if len(self.positions) < max_positions and entry_universe:
             # Phase 1: Gather candidates with momentum scores
             candidates = []
-            for symbol in self.symbols:
+            for symbol in entry_universe:
                 if symbol in self.positions:
                     continue
 
@@ -745,6 +809,8 @@ class Backtester:
 
                 # Compute momentum
                 mom = self._compute_momentum(symbol, date)
+                if market_regime == "bear" and symbol in bear_symbol_set and mom <= 0:
+                    continue
                 candidates.append((symbol, df, mom))
 
             if not candidates:
@@ -768,26 +834,33 @@ class Backtester:
 
                 # Multi-timeframe: weekly trend check (hard filter)
                 weekly_bull = self._is_weekly_bullish(symbol, date)
-                if config.WEEKLY_TREND_ENABLED and not weekly_bull:
+                if market_regime == "bull" and config.WEEKLY_TREND_ENABLED and not weekly_bull:
                     continue  # skip entry when weekly trend disagrees
 
                 signal = self._check_entry(
                     df, momentum=mom, weekly_bullish=weekly_bull,
                     score_threshold=dyn_threshold,
+                    regime=("bear" if (market_regime == "bear" and symbol in bear_symbol_set) else "bull"),
                 )
                 if signal is None:
                     continue
 
                 entry_price = self._apply_slippage(signal["price"], "BUY")
                 atr = signal["atr"]
-                stop_loss = round(entry_price - atr * atr_stop_mult, 2)
-                take_profit = round(entry_price + atr * atr_profit_mult, 2)
+                entry_mode = "bear" if (market_regime == "bear" and symbol in bear_symbol_set) else "bull"
+                stop_mult = config.BEAR_ATR_STOP_MULTIPLIER if entry_mode == "bear" else atr_stop_mult
+                profit_mult = config.BEAR_ATR_PROFIT_MULTIPLIER if entry_mode == "bear" else atr_profit_mult
+                stop_loss = round(entry_price - atr * stop_mult, 2)
+                take_profit = round(entry_price + atr * profit_mult, 2)
 
                 qty = self._size_position(entry_price, stop_loss, date)
 
                 # Apply volatility regime scaling
                 if vol_scale != 1.0:
                     qty = round(qty * vol_scale, 3) if config.FRACTIONAL_SHARES else math.floor(qty * vol_scale)
+
+                if entry_mode == "bear":
+                    qty = round(qty * config.BEAR_MAX_POSITION_SCALE, 3) if config.FRACTIONAL_SHARES else math.floor(qty * config.BEAR_MAX_POSITION_SCALE)
 
                 if qty <= 0:
                     continue
@@ -805,11 +878,12 @@ class Backtester:
                     qty=qty,
                     stop_loss=stop_loss,
                     take_profit=take_profit,
+                    regime=entry_mode,
                 )
                 self.all_trades.append(Trade(
                     symbol=symbol, side="BUY", date=date, price=entry_price,
                     qty=qty, stop_loss=stop_loss, take_profit=take_profit,
-                    reason=signal["reason"],
+                    reason=f"{entry_mode.upper()} | {signal['reason']}",
                 ))
                 self._sector_add(symbol)
 

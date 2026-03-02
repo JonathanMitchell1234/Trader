@@ -13,7 +13,12 @@ from indicators import compute_all, compute_weekly_trend, realized_volatility
 from pdt_guard import PDTGuard
 from risk_manager import RiskManager
 from screener import Screener
-from strategy import check_entry, check_exit
+from strategy import (
+    check_entry,
+    check_exit,
+    classify_market_regime,
+    compute_momentum,
+)
 from logger import get_logger
 
 log = get_logger("executor")
@@ -27,6 +32,7 @@ class TradeExecutor:
         self.pdt = PDTGuard()
         self.screener = Screener(self.broker)
         self._init_risk_manager()
+        self._last_regime = "bull"
         self._sector_counts: dict[str, int] = {}
         self._rebuild_sector_counts()
 
@@ -96,6 +102,22 @@ class TradeExecutor:
             log.warning("Dynamic threshold check failed: %s", exc)
         return base
 
+    def _get_market_regime(self, spy_df=None) -> str:
+        """Return current market regime: bull or bear (with hysteresis)."""
+        if not config.MARKET_REGIME_ENABLED:
+            return "bull"
+        try:
+            if spy_df is None:
+                spy_df = self.broker.get_bars(config.MARKET_REGIME_SYMBOL, limit=300)
+            if spy_df is None or len(spy_df) < config.EMA_LONG + 5:
+                return self._last_regime
+            spy_df = compute_all(spy_df)
+            self._last_regime = classify_market_regime(spy_df, last_regime=self._last_regime)
+            return self._last_regime
+        except Exception as exc:
+            log.warning("Market regime check failed: %s", exc)
+            return self._last_regime
+
     # ─────────────────────────────────────────────────────────
     # EXIT SCAN – check existing positions for exit signals
     # ─────────────────────────────────────────────────────────
@@ -108,11 +130,13 @@ class TradeExecutor:
         positions = self.broker.get_positions()
         active_symbols = {p.symbol for p in positions}
         self.pdt.cleanup_stale(active_symbols)
+        market_regime = self._get_market_regime()
 
         closed = 0
         for pos in positions:
             symbol = pos.symbol
             qty = int(pos.qty)
+            hold_days = self.pdt.days_held(symbol) or 0
 
             # PDT check – can we sell today?
             if not self.pdt.can_sell_today(symbol):
@@ -135,7 +159,12 @@ class TradeExecutor:
                 continue
 
             entry_price = float(pos.avg_entry_price)
-            signal = check_exit(df, entry_price)
+            signal = check_exit(
+                df,
+                entry_price=entry_price,
+                hold_days=hold_days,
+                regime=market_regime,
+            )
 
             if signal is not None:
                 log.info(
@@ -207,36 +236,46 @@ class TradeExecutor:
             log.info("Max positions reached - skipping entry scan")
             return 0
 
-        # Market regime filter: don't open new longs in a bear market
+        # Market regime classification
         spy_df = None
         if config.MARKET_REGIME_ENABLED:
             try:
-                spy_df = self.broker.get_bars(config.MARKET_REGIME_SYMBOL, limit=250)
-                if spy_df is not None and len(spy_df) >= 200:
-                    from indicators import compute_all as _compute
-                    spy_df = _compute(spy_df)
-                    spy_row = spy_df.iloc[-1]
-                    spy_ema200 = spy_row.get("ema_200", None)
-                    if spy_ema200 is not None and spy_row["close"] < spy_ema200:
-                        log.info("BEAR MARKET - %s below EMA-200, skipping entries",
-                                 config.MARKET_REGIME_SYMBOL)
-                        return 0
-            except Exception as exc:
-                log.warning("Market regime check failed: %s", exc)
+                spy_df = self.broker.get_bars(config.MARKET_REGIME_SYMBOL, limit=300)
+            except Exception:
+                spy_df = None
+
+        regime = self._get_market_regime(spy_df)
+        if regime == "risk_off":
+            log.info("RISK-OFF regime detected - skipping new entries")
+            return 0
+
+        if regime == "bear" and not config.BEAR_STRATEGY_ENABLED:
+            log.info("BEAR MARKET detected, bear strategy disabled - skipping entries")
+            return 0
 
         # Advanced features: vol regime + dynamic threshold
-        vol_scale = self._get_vol_regime_scale()
-        dyn_threshold = self._get_dynamic_threshold(spy_df)
+        vol_scale = self._get_vol_regime_scale() if regime == "bull" else 1.0
+        dyn_threshold = self._get_dynamic_threshold(spy_df) if regime == "bull" else config.BEAR_ENTRY_SCORE_THRESHOLD
 
-        if dyn_threshold != config.ENTRY_SCORE_THRESHOLD:
+        if regime == "bull" and dyn_threshold != config.ENTRY_SCORE_THRESHOLD:
             log.info("Dynamic threshold: %d (base %d)", dyn_threshold, config.ENTRY_SCORE_THRESHOLD)
+
+        entry_symbols = config.BEAR_WATCHLIST if regime == "bear" else config.WATCHLIST
+        if regime == "bear":
+            current_positions = len(self.broker.get_positions())
+            if current_positions >= config.BEAR_MAX_POSITIONS_CAP:
+                log.info("Bear cap reached (%d/%d) - skipping new entries", current_positions, config.BEAR_MAX_POSITIONS_CAP)
+                return 0
+            log.info("Regime=%s, scanning %d bear symbols", regime, len(entry_symbols))
+        else:
+            log.info("Regime=%s, scanning %d symbols", regime, len(entry_symbols))
 
         # Symbols we already hold - skip them
         held = {p.symbol for p in self.broker.get_positions()}
         # Symbols with pending buy orders - skip them too
         pending = {o.symbol for o in self.broker.get_open_orders() if o.side == "buy"}
 
-        candidates = self.screener.screen()
+        candidates = self.screener.screen(entry_symbols)
         opened = 0
 
         for c in candidates:
@@ -245,6 +284,9 @@ class TradeExecutor:
                 continue
 
             if not self.risk.can_open_new_position():
+                break
+
+            if regime == "bear" and (len(held) + opened) >= config.BEAR_MAX_POSITIONS_CAP:
                 break
 
             if not self.pdt.can_buy_today(symbol):
@@ -260,7 +302,7 @@ class TradeExecutor:
 
             # Weekly trend check
             weekly_bull = True
-            if config.WEEKLY_TREND_ENABLED:
+            if regime == "bull" and config.WEEKLY_TREND_ENABLED:
                 try:
                     df_full = c.get("df")
                     if df_full is not None and len(df_full) > config.WEEKLY_EMA_SLOW * 5:
@@ -269,18 +311,25 @@ class TradeExecutor:
                 except Exception:
                     pass
 
-            signal = check_entry(c["df"], weekly_bullish=weekly_bull)
+            momentum = compute_momentum(c["df"])
+            signal = check_entry(
+                c["df"],
+                weekly_bullish=weekly_bull,
+                regime=regime,
+                momentum=momentum,
+                score_threshold=dyn_threshold,
+            )
             if signal is None:
-                continue
-
-            # Apply dynamic threshold manually (check_entry uses config default)
-            if signal["score"] < dyn_threshold:
                 continue
 
             entry_price = signal["price"]
             atr = signal["atr"]
-            stop_loss = self.risk.compute_stop_loss(entry_price, atr)
-            take_profit = self.risk.compute_take_profit(entry_price, atr)
+            if regime == "bear":
+                stop_loss = round(entry_price - atr * config.BEAR_ATR_STOP_MULTIPLIER, 2)
+                take_profit = round(entry_price + atr * config.BEAR_ATR_PROFIT_MULTIPLIER, 2)
+            else:
+                stop_loss = self.risk.compute_stop_loss(entry_price, atr)
+                take_profit = self.risk.compute_take_profit(entry_price, atr)
 
             qty = self.risk.calculate_position_size(
                 entry_price=entry_price,
@@ -293,13 +342,17 @@ class TradeExecutor:
                 qty = round(qty * vol_scale, 3) if config.FRACTIONAL_SHARES else int(qty * vol_scale)
                 log.info("Vol regime scale: %.2f -> qty adjusted to %.3f", vol_scale, qty)
 
+            if regime == "bear" and qty > 0:
+                qty = round(qty * config.BEAR_MAX_POSITION_SCALE, 3) if config.FRACTIONAL_SHARES else int(qty * config.BEAR_MAX_POSITION_SCALE)
+
             if qty == 0:
                 log.info("Position size = 0 for %s - skipping", symbol)
                 continue
 
             log.info(
-                "ENTRY %s  qty=%.3f  price=%.2f  SL=%.2f  TP=%.2f  [%s]",
+                "ENTRY %s  regime=%s  qty=%.3f  price=%.2f  SL=%.2f  TP=%.2f  [%s]",
                 symbol,
+                regime,
                 qty,
                 entry_price,
                 stop_loss,

@@ -52,6 +52,71 @@ from logger import get_logger
 log = get_logger("strategy")
 
 
+def classify_market_regime(
+    regime_df: pd.DataFrame,
+    last_regime: str = "bull",
+) -> str:
+    """
+    Classify market regime using SPY (or configured proxy) close vs EMA-200
+    with multi-day confirmation to reduce whipsaws.
+
+        Returns one of:
+            - "bull": normal long strategy
+            - "risk_off": no new entries (legacy bear filter behavior)
+            - "bear": enable bear playbook (inverse/defensive focus)
+    """
+    if regime_df is None or len(regime_df) < max(config.EMA_LONG, config.EMA_TREND) + 5:
+        return last_regime
+
+    confirm = max(2, int(config.MARKET_REGIME_CONFIRM_DAYS))
+    if len(regime_df) < confirm + 1:
+        return last_regime
+
+    subset = regime_df.iloc[-confirm:]
+    if "ema_200" not in subset.columns or "ema_trend" not in subset.columns:
+        return last_regime
+
+    close = subset["close"]
+    ema_200 = subset["ema_200"]
+    ema_50 = subset["ema_trend"]
+
+    if close.isna().any() or ema_200.isna().any() or ema_50.isna().any():
+        return last_regime
+
+    latest_close = float(close.iloc[-1])
+    latest_ema200 = float(ema_200.iloc[-1])
+
+    # Fast bull re-entry: once market proxy closes back above EMA-200,
+    # revert to bull regime immediately to avoid missing recovery legs.
+    if latest_close > latest_ema200:
+        return "bull"
+
+    buffer = float(config.MARKET_REGIME_EMA_BUFFER)
+    ema200_rising = ema_200.iloc[-1] > ema_200.iloc[0]
+    ema200_falling = ema_200.iloc[-1] < ema_200.iloc[0]
+
+    dd_lookback = max(60, int(config.BEAR_REGIME_DRAWDOWN_LOOKBACK))
+    recent = regime_df["close"].iloc[-dd_lookback:]
+    recent_high = float(recent.max()) if len(recent) else float(close.iloc[-1])
+    drawdown = ((latest_close - recent_high) / recent_high) if recent_high > 0 else 0.0
+    deep_drawdown = drawdown <= -float(config.BEAR_REGIME_DRAWDOWN_TRIGGER)
+
+    bear_confirmed = bool(
+        (close < ema_200 * (1 - buffer)).all()
+        and ema_50.iloc[-1] < ema_200.iloc[-1]
+        and ema_50.iloc[-1] < ema_50.iloc[0]
+        and ema200_falling
+        and deep_drawdown
+    )
+
+    if bear_confirmed:
+        return "bear"
+
+    # Below EMA-200 but not a deep/prolonged bear: stay risk-off and
+    # preserve legacy behavior (skip new entries rather than forcing shorts).
+    return "risk_off"
+
+
 # ─────────────────────────────────────────────
 # ENTRY  (scoring system)
 # ─────────────────────────────────────────────
@@ -184,6 +249,78 @@ def score_entry(df: pd.DataFrame, weekly_bullish: bool = True) -> tuple[int, lis
     return score, factors
 
 
+def score_entry_bear(df: pd.DataFrame, momentum: float = 0.0) -> tuple[int, list[str]]:
+    """
+    Score entries for bear regime (long inverse/defensive instruments).
+    Designed to be trend-following and faster to de-risk.
+    """
+    if len(df) < max(config.MOMENTUM_LOOKBACK + 1, config.EMA_SLOPE_PERIOD + 1, 3):
+        return 0, []
+
+    cur = df.iloc[-1]
+    prv = df.iloc[-2]
+
+    price = cur["close"]
+    ema_fast = cur["ema_fast"]
+    ema_slow = cur["ema_slow"]
+    ema_trend = cur["ema_trend"]
+    rsi = cur["rsi"]
+    macd_hist = cur["macd_hist"]
+    adx = cur["adx"]
+    vol_ratio = cur["vol_ratio"]
+    atr = cur["atr"]
+
+    if pd.isna(rsi) or pd.isna(atr) or pd.isna(adx):
+        return 0, []
+
+    score = 0
+    factors: list[str] = []
+
+    if price > ema_trend:
+        score += 2
+        factors.append("Above EMA-50")
+
+    if ema_fast > ema_slow:
+        score += 1
+        factors.append("EMA-9 > EMA-21")
+
+    if (prv["ema_fast"] <= prv["ema_slow"]) and (ema_fast > ema_slow):
+        score += 1
+        factors.append("Bullish EMA cross")
+
+    if len(df) >= config.EMA_SLOPE_PERIOD + 1:
+        ema50_now = cur["ema_trend"]
+        ema50_ago = df.iloc[-(config.EMA_SLOPE_PERIOD + 1)]["ema_trend"]
+        if not pd.isna(ema50_now) and not pd.isna(ema50_ago) and ema50_now > ema50_ago:
+            score += 1
+            factors.append("EMA-50 rising")
+
+    if 40 <= rsi <= 72:
+        score += 1
+        factors.append(f"RSI healthy ({rsi:.0f})")
+
+    if macd_hist > 0:
+        score += 1
+        factors.append("MACD positive")
+
+    if adx >= 18:
+        score += 1
+        factors.append(f"ADX {adx:.0f}")
+
+    if vol_ratio >= config.VOLUME_SURGE_FACTOR:
+        score += 1
+        factors.append(f"Volume {vol_ratio:.1f}x")
+
+    if momentum > 0.03:
+        score += 2
+        factors.append(f"Momentum +{momentum*100:.0f}%")
+    elif momentum > 0:
+        score += 1
+        factors.append(f"Momentum +{momentum*100:.0f}%")
+
+    return score, factors
+
+
 def compute_momentum(df: pd.DataFrame) -> float:
     """
     Compute the momentum (rate of change) over the lookback period.
@@ -202,14 +339,41 @@ def compute_momentum(df: pd.DataFrame) -> float:
     return (cur_close - past_close) / past_close
 
 
-def check_entry(df: pd.DataFrame, weekly_bullish: bool = True) -> dict | None:
+def check_entry(
+    df: pd.DataFrame,
+    weekly_bullish: bool = True,
+    regime: str = "bull",
+    momentum: float = 0.0,
+    score_threshold: int | None = None,
+) -> dict | None:
     """
     Evaluate the latest bar using the scoring system.
     Return a signal dict if score meets threshold, else None.
     """
-    score, factors = score_entry(df, weekly_bullish=weekly_bullish)
+    use_bear_logic = regime == "bear"
 
-    if score < config.ENTRY_SCORE_THRESHOLD:
+    if use_bear_logic:
+        score, factors = score_entry_bear(df, momentum=momentum)
+        threshold = (
+            score_threshold
+            if score_threshold is not None
+            else config.BEAR_ENTRY_SCORE_THRESHOLD
+        )
+    else:
+        score, factors = score_entry(df, weekly_bullish=weekly_bullish)
+        if momentum > 0.05:
+            score += config.MOMENTUM_SCORE_WEIGHT
+            factors.append(f"Momentum +{momentum*100:.0f}%")
+        elif momentum > 0.02:
+            score += 1
+            factors.append(f"Momentum +{momentum*100:.0f}%")
+        threshold = (
+            score_threshold
+            if score_threshold is not None
+            else config.ENTRY_SCORE_THRESHOLD
+        )
+
+    if score < threshold:
         return None
 
     cur = df.iloc[-1]
@@ -227,17 +391,91 @@ def check_entry(df: pd.DataFrame, weekly_bullish: bool = True) -> dict | None:
         "adx": cur["adx"],
         "vol_ratio": cur["vol_ratio"],
         "score": score,
+        "regime": regime,
         "reason": reason,
     }
-    log.info("ENTRY signal: price=%.2f  %s", price, reason)
+    log.info("ENTRY signal: regime=%s price=%.2f  %s", regime, price, reason)
     return signal
 
 
 # ─────────────────────────────────────────────
 # EXIT  (layered – hard + soft)
 # ─────────────────────────────────────────────
-def check_exit(df: pd.DataFrame, entry_price: float = 0.0,
-               hold_days: int = 0) -> dict | None:
+def _check_exit_bear(
+    df: pd.DataFrame,
+    entry_price: float = 0.0,
+    hold_days: int = 0,
+) -> dict | None:
+    if len(df) < 4:
+        return None
+
+    cur = df.iloc[-1]
+    prv = df.iloc[-2]
+
+    price = cur["close"]
+    ema_fast = cur["ema_fast"]
+    ema_slow = cur["ema_slow"]
+    ema_trend = cur["ema_trend"]
+    rsi = cur["rsi"]
+    macd_hist = cur["macd_hist"]
+
+    if pd.isna(rsi):
+        return None
+
+    hard_reasons: list[str] = []
+    soft_reasons: list[str] = []
+
+    if price < ema_trend and ema_fast < ema_slow:
+        hard_reasons.append("Bear-mode trend break")
+
+    if (prv["ema_fast"] >= prv["ema_slow"]) and (ema_fast < ema_slow):
+        soft_reasons.append("Bearish EMA crossover")
+
+    if prv["macd_hist"] > 0 and macd_hist < 0:
+        soft_reasons.append("MACD flipped negative")
+
+    if rsi >= config.BEAR_RSI_OVERBOUGHT_EXIT:
+        soft_reasons.append(f"RSI overbought ({rsi:.1f})")
+
+    if entry_price > 0 and hold_days >= config.BEAR_DEAD_MONEY_DAYS:
+        move_pct = abs(price - entry_price) / entry_price
+        if move_pct < config.BEAR_DEAD_MONEY_THRESHOLD:
+            soft_reasons.append(
+                f"Dead money ({hold_days}d, {move_pct*100:.1f}% move)"
+            )
+
+    if len(df) >= config.MOMENTUM_LOOKBACK + 1:
+        past_price = df.iloc[-(config.MOMENTUM_LOOKBACK + 1)]["close"]
+        if not pd.isna(past_price) and past_price > 0:
+            mom = (price - past_price) / past_price
+            if mom < -0.03:
+                soft_reasons.append(f"Momentum decay ({mom*100:.1f}%)")
+
+    reasons: list[str] = []
+    if hard_reasons:
+        reasons = hard_reasons
+    elif soft_reasons:
+        reasons = soft_reasons
+
+    if not reasons:
+        return None
+
+    return {
+        "action": "SELL",
+        "price": price,
+        "rsi": rsi,
+        "macd_hist": macd_hist,
+        "reasons": reasons,
+        "regime": "bear",
+    }
+
+
+def check_exit(
+    df: pd.DataFrame,
+    entry_price: float = 0.0,
+    hold_days: int = 0,
+    regime: str = "bull",
+) -> dict | None:
     """
     Evaluate whether an existing position should be closed.
 
@@ -245,6 +483,16 @@ def check_exit(df: pd.DataFrame, entry_price: float = 0.0,
     SOFT exits require 2+ simultaneous signals to avoid
     getting shaken out by normal volatility.
     """
+    if regime == "bear":
+        signal = _check_exit_bear(df, entry_price=entry_price, hold_days=hold_days)
+        if signal is not None:
+            log.info(
+                "EXIT  signal: regime=bear price=%.2f  reasons=%s",
+                signal["price"],
+                ", ".join(signal["reasons"]),
+            )
+        return signal
+
     if len(df) < 4:
         return None
 
@@ -320,6 +568,7 @@ def check_exit(df: pd.DataFrame, entry_price: float = 0.0,
         "rsi": rsi,
         "macd_hist": macd_hist,
         "reasons": reasons,
+        "regime": "bull",
     }
     log.info("EXIT  signal: price=%.2f  reasons=%s", price, ", ".join(reasons))
     return signal

@@ -2,6 +2,11 @@
 
 A fully automated **swing-trading bot** that uses the Alpaca brokerage API to scan for setups, size positions, execute trades, and manage exits — all while **guaranteeing zero day trades** so you never trigger the Pattern Day Trader rule.
 
+The strategy is now **regime-adaptive** with three states:
+- `bull`: normal long swing strategy
+- `risk_off`: no new entries (legacy safety behavior)
+- `bear`: dedicated bear playbook using inverse/defensive ETFs (still long-only)
+
 ---
 
 ## How It Works
@@ -25,9 +30,9 @@ Watchlist (60+ liquid stocks/ETFs)
    └────┬─────┘
         │
         ▼
-   ┌──────────┐
-   │ Risk Mgr │  ATR-based stops · 2% risk per trade · 12% max position
-   └────┬─────┘
+     ┌──────────┐
+     │ Risk Mgr │  ATR stops · dynamic position sizing · PDT-safe exits
+     └────┬─────┘
         │
         ▼
    ┌──────────┐
@@ -35,27 +40,24 @@ Watchlist (60+ liquid stocks/ETFs)
    └──────────┘
 ```
 
-### Entry Criteria (ALL must be true)
-| # | Condition | Purpose |
-|---|-----------|---------|
-| 1 | Price > EMA-50 | Confirms uptrend |
-| 2 | EMA-9 crosses above EMA-21 **or** RSI pulls back to 30-45 zone | Timing |
-| 3 | MACD histogram positive / turning | Momentum |
-| 4 | Volume ≥ 1.3× 20-day average | Conviction |
-| 5 | ADX > 20 | Trend strength |
+### Entry Criteria
+Entries use a **scoring model** (not a strict all-conditions gate). Typical factors include:
+- Trend alignment (EMA-50/EMA-200), EMA crossover, and EMA slope
+- RSI pullback quality, MACD behavior, ADX, and volume confirmation
+- Momentum ranking and optional weekly trend alignment
+- In `bear` regime, a dedicated bear score is used for inverse/defensive ETFs
 
-### Exit Criteria (ANY triggers sell)
-- RSI ≥ 70 (overbought)
-- EMA-9 crosses below EMA-21
-- MACD histogram flips negative
-- Price closes below EMA-50
-- Bracket stop-loss / take-profit hit
+### Exit Criteria
+Exits are **layered**:
+- Hard exits (immediate): stop-loss/take-profit or major trend break
+- Soft exits (confirmation-based): overbought, bearish crossover, momentum decay, dead-money conditions
+- Trailing stops tighten as gains increase (separate bull vs bear parameters)
 
 ### PDT Protection
 The bot enforces a **zero day-trade policy**:
 - A local ledger records every buy with its fill date
 - Before any sell, the guard checks the position wasn't opened today
-- Minimum hold period: **1 calendar day** (configurable)
+- Minimum hold period: **2 calendar days** (configurable)
 - The PDT counter will always stay at **0**
 
 ---
@@ -64,6 +66,7 @@ The bot enforces a **zero day-trade policy**:
 
 ```
 Trader/
+├── backtest.py       # Historical simulator and performance report
 ├── main.py           # Entry point & scheduler
 ├── config.py         # All tunable parameters
 ├── broker.py         # Alpaca API wrapper
@@ -73,6 +76,7 @@ Trader/
 ├── pdt_guard.py      # Pattern Day Trader protection
 ├── risk_manager.py   # Position sizing & risk limits
 ├── executor.py       # Trade execution orchestrator
+├── run_validation.py # Benchmark validator (bear + bull windows)
 ├── logger.py         # Logging setup
 ├── requirements.txt  # Python dependencies
 ├── .env.example      # API key template
@@ -118,6 +122,9 @@ python main.py --once
 
 # Check account status
 python main.py --status
+
+# Run benchmark validation windows (bear + bull)
+python run_validation.py
 ```
 
 ---
@@ -128,15 +135,24 @@ All parameters are in [`config.py`](config.py). Key settings:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `MAX_OPEN_POSITIONS` | 8 | Max simultaneous positions |
-| `MAX_POSITION_PCT` | 12% | Max equity per position |
+| `MAX_OPEN_POSITIONS` | 10 | Max simultaneous positions |
+| `MAX_POSITION_PCT` | 15% | Max equity per position |
 | `MAX_LOSS_PER_TRADE_PCT` | 2% | Risk budget per trade |
-| `ATR_STOP_MULTIPLIER` | 2.0 | Stop loss = Entry − 2×ATR |
-| `ATR_PROFIT_MULTIPLIER` | 3.0 | Take profit = Entry + 3×ATR |
-| `TRAILING_STOP_PCT` | 5% | Trailing stop on winners |
-| `MIN_HOLD_CALENDAR_DAYS` | 1 | PDT safety — minimum hold |
+| `ATR_STOP_MULTIPLIER` | 3.0 | Stop loss = Entry − ATR×multiplier |
+| `ATR_PROFIT_MULTIPLIER` | 6.0 | Take profit = Entry + ATR×multiplier |
+| `TRAILING_STOP_PCT` | 4% | Trailing stop on winners |
+| `MIN_HOLD_CALENDAR_DAYS` | 2 | PDT safety — minimum hold |
 | `SCAN_INTERVAL_MINUTES` | 30 | How often to scan for entries |
 | `CHECK_EXITS_MINUTES` | 15 | How often to check exits |
+
+### Market Regime Controls
+Key bear-adaptation settings are in `config.py`:
+- `MARKET_REGIME_ENABLED`, `MARKET_REGIME_SYMBOL`
+- `MARKET_REGIME_CONFIRM_DAYS`, `MARKET_REGIME_EMA_BUFFER`
+- `BEAR_REGIME_DRAWDOWN_LOOKBACK`, `BEAR_REGIME_DRAWDOWN_TRIGGER`
+- `BEAR_STRATEGY_ENABLED`, `BEAR_WATCHLIST`, `BEAR_ENTRY_SCORE_THRESHOLD`
+- `BEAR_ATR_STOP_MULTIPLIER`, `BEAR_ATR_PROFIT_MULTIPLIER`
+- `BEAR_TRAILING_STOP_*` and `BEAR_MAX_POSITION_SCALE`
 
 ### Watchlist
 The default watchlist includes ~60 liquid mid/large-cap stocks and ETFs. Edit `WATCHLIST` in `config.py` to customize.
@@ -146,10 +162,10 @@ The default watchlist includes ~60 liquid mid/large-cap stocks and ETFs. Edit `W
 ## Risk Management
 
 - **Per-trade risk**: sized so a stop-loss hit only costs ≤ 2% of equity
-- **Position cap**: no single position exceeds 12% of equity
-- **Portfolio cap**: max 8 concurrent positions, max 95% buying-power usage
+- **Position cap**: no single position exceeds 15% of equity (auto-adjusts for small accounts)
+- **Portfolio cap**: max 10 concurrent positions (auto-adjusts for small accounts), max 95% buying-power usage
 - **Bracket orders**: every entry has an automatic stop-loss and take-profit
-- **Trailing stops**: automatically added once a position is 5%+ profitable
+- **Trailing stops**: adaptive and regime-aware (bull vs bear settings)
 - **PDT lock**: zero same-day round trips — ever
 
 ---
@@ -163,4 +179,3 @@ Logs are written to both the console and `logs/trader.log`. The PDT ledger is st
 ## Disclaimer
 
 This bot is for **educational and paper-trading purposes**. Trading stocks involves risk of loss. Past performance of any strategy does not guarantee future results. Use at your own risk.
-# Trader
