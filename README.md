@@ -141,7 +141,7 @@ All parameters are in [`config.py`](config.py). Key settings:
 | `ATR_STOP_MULTIPLIER` | 3.0 | Stop loss = Entry − ATR×multiplier |
 | `ATR_PROFIT_MULTIPLIER` | 6.0 | Take profit = Entry + ATR×multiplier |
 | `TRAILING_STOP_PCT` | 4% | Trailing stop on winners |
-| `MIN_HOLD_CALENDAR_DAYS` | 2 | PDT safety — minimum hold |
+| `MIN_HOLD_CALENDAR_DAYS` | 1 | PDT safety — minimum hold |
 | `SCAN_INTERVAL_MINUTES` | 30 | How often to scan for entries |
 | `CHECK_EXITS_MINUTES` | 15 | How often to check exits |
 

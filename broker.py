@@ -228,11 +228,19 @@ class AlpacaBroker:
 
     # ── Market Clock ─────────────────────────────────────────
     def is_market_open(self) -> bool:
-        clock = self.api.get_clock()
-        return clock.is_open
+        try:
+            clock = self.api.get_clock()
+            return bool(clock.is_open)
+        except Exception as exc:
+            log.warning("Clock check failed (treating as closed): %s", exc)
+            return False
 
     def get_clock(self):
-        return self.api.get_clock()
+        try:
+            return self.api.get_clock()
+        except Exception as exc:
+            log.warning("Get clock failed: %s", exc)
+            return None
 
     # ── Activity / Order History (for PDT tracking) ──────────
     def get_closed_orders(

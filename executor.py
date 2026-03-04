@@ -6,6 +6,7 @@ Handles the full lifecycle: scan → signal → size → order → track.
 from __future__ import annotations
 
 import datetime as dt
+from collections import Counter
 
 import config
 from broker import AlpacaBroker
@@ -166,6 +167,12 @@ class TradeExecutor:
         self.pdt.cleanup_stale(active_symbols)
         market_regime = self._get_market_regime()
 
+        total_positions = len(positions)
+        if total_positions == 0:
+            log.info("Exit scan complete – no open positions")
+            return 0
+
+        decision_counts: Counter[str] = Counter()
         closed = 0
         for pos in positions:
             symbol = pos.symbol
@@ -173,6 +180,7 @@ class TradeExecutor:
                 qty = float(pos.qty)
             except (TypeError, ValueError):
                 log.warning("Skipping exit for %s - invalid qty '%s'", symbol, pos.qty)
+                decision_counts["invalid_qty"] += 1
                 continue
             hold_days = self.pdt.days_held(symbol) or 0
 
@@ -184,16 +192,26 @@ class TradeExecutor:
                     symbol,
                     days,
                 )
+                decision_counts["pdt_blocked"] += 1
                 continue
 
             # Fetch fresh data and compute indicators
             try:
                 df = self.broker.get_bars(symbol)
                 if df is None or len(df) < config.EMA_TREND + 5:
+                    bars = 0 if df is None else len(df)
+                    log.info(
+                        "Holding %s – insufficient bars for exit logic (%d < %d)",
+                        symbol,
+                        bars,
+                        config.EMA_TREND + 5,
+                    )
+                    decision_counts["insufficient_bars"] += 1
                     continue
                 df = compute_all(df)
             except Exception as exc:
                 log.warning("Data error for %s: %s", symbol, exc)
+                decision_counts["data_error"] += 1
                 continue
 
             entry_price = float(pos.avg_entry_price)
@@ -205,12 +223,17 @@ class TradeExecutor:
             )
 
             if signal is not None:
+                exit_price = float(signal["price"])
+                pnl_pct = ((exit_price - entry_price) / entry_price) * 100
                 log.info(
-                    "EXIT  %s  qty=%.3f  entry=%.2f  now=%.2f  reasons=%s",
+                    "EXIT  %s  qty=%.3f  entry=%.2f  now=%.2f  pnl=%.2f%%  hold=%dd  regime=%s  reasons=%s",
                     symbol,
                     qty,
                     entry_price,
-                    signal["price"],
+                    exit_price,
+                    pnl_pct,
+                    hold_days,
+                    market_regime,
                     signal["reasons"],
                 )
                 try:
@@ -221,12 +244,15 @@ class TradeExecutor:
                     self.broker.submit_market_sell(symbol, qty)
                     self.pdt.record_sell(symbol)
                     closed += 1
+                    decision_counts["closed"] += 1
                 except Exception as exc:
                     log.error("Sell order failed for %s: %s", symbol, exc)
+                    decision_counts["sell_failed"] += 1
             else:
                 # If position is profitable, consider adding trailing stop
                 current_price = float(pos.current_price)
                 unrealised_pct = (current_price - entry_price) / entry_price
+                decision_counts["held_no_exit_signal"] += 1
 
                 # Determine which trailing stop level applies
                 if unrealised_pct >= config.TRAILING_STOP_TIGHT_ACTIVATE:
@@ -244,7 +270,7 @@ class TradeExecutor:
                     )
                     if not has_trailing:
                         log.info(
-                            "Adding trailing stop for %s (%.1f%% profit, trail=%.1f%%)",
+                            "Holding %s – no hard exit signal; adding trailing stop (pnl=%.1f%%, trail=%.1f%%)",
                             symbol,
                             unrealised_pct * 100,
                             trail_pct * 100,
@@ -253,10 +279,39 @@ class TradeExecutor:
                             self.broker.submit_trailing_stop(
                                 symbol, qty, trail_pct
                             )
+                            decision_counts["trail_added"] += 1
                         except Exception as exc:
                             log.warning("Trailing stop failed for %s: %s", symbol, exc)
+                            decision_counts["trail_failed"] += 1
+                    else:
+                        log.info(
+                            "Holding %s – no hard exit signal; trailing stop already active",
+                            symbol,
+                        )
+                        decision_counts["trail_already_active"] += 1
+                else:
+                    log.info(
+                        "Holding %s – no hard exit signal (pnl=%.1f%%, below trailing activation %.1f%%)",
+                        symbol,
+                        unrealised_pct * 100,
+                        config.TRAILING_STOP_ACTIVATE_PCT * 100,
+                    )
+                    decision_counts["trail_not_armed"] += 1
 
-        log.info("Exit scan complete – closed %d position(s)", closed)
+        log.info(
+            "Exit scan complete – closed %d/%d position(s)",
+            closed,
+            total_positions,
+        )
+        if decision_counts:
+            summary = ", ".join(
+                f"{reason}={count}"
+                for reason, count in sorted(decision_counts.items())
+            )
+            if closed == 0:
+                log.info("No positions closed this cycle. Decision summary: %s", summary)
+            else:
+                log.info("Exit decision summary: %s", summary)
         return closed
 
     # ─────────────────────────────────────────────────────────

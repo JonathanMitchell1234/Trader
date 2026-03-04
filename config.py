@@ -38,7 +38,7 @@ SMALL_ACCOUNT_THRESHOLD = 2_000     # below this $ → small-account rules kick 
 # the same symbol on the same calendar day.
 MAX_DAY_TRADES_ALLOWED = 0          # hard-lock: no same-day round trips
 PDT_LOOKBACK_DAYS = 5               # rolling window (business days)
-MIN_HOLD_CALENDAR_DAYS = 2          # minimum days to hold before selling
+MIN_HOLD_CALENDAR_DAYS = 1          # next-day sells allowed; same-day still blocked
 
 # ─────────────────────────────────────────────
 # Strategy – Technical Indicators
@@ -296,8 +296,8 @@ BAR_TIMEFRAME = "1Day"    # daily bars for swing trading
 # ─────────────────────────────────────────────
 # Scheduling
 # ─────────────────────────────────────────────
-SCAN_INTERVAL_MINUTES = 30    # re-scan for entries every N minutes
-CHECK_EXITS_MINUTES = 15      # check exit signals every N minutes
+SCAN_INTERVAL_MINUTES = 15   # re-scan for entries every N minutes
+CHECK_EXITS_MINUTES = 5      # check exit signals every N minutes
 
 # ─────────────────────────────────────────────
 # Logging

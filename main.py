@@ -35,10 +35,13 @@ def print_status() -> None:
     print("\n" + "=" * 60)
     print("  SWING TRADING BOT – STATUS")
     print("=" * 60)
+    market_open = clock.is_open if clock is not None else "unknown"
+    next_open = clock.next_open if clock is not None else "unknown"
+    next_close = clock.next_close if clock is not None else "unknown"
     print(f"  Mode           : {config.TRADING_MODE.upper()}")
-    print(f"  Market open    : {clock.is_open}")
-    print(f"  Next open      : {clock.next_open}")
-    print(f"  Next close     : {clock.next_close}")
+    print(f"  Market open    : {market_open}")
+    print(f"  Next open      : {next_open}")
+    print(f"  Next close     : {next_close}")
     print(f"  Equity         : ${float(acct.equity):>12,.2f}")
     print(f"  Cash           : ${float(acct.cash):>12,.2f}")
     print(f"  Buying power   : ${float(acct.buying_power):>12,.2f}")
@@ -51,12 +54,12 @@ def print_status() -> None:
         print("  " + "-" * 54)
         for p in positions:
             sym = p.symbol
-            qty = int(p.qty)
+            qty = float(p.qty)
             entry = float(p.avg_entry_price)
             cur = float(p.current_price)
             pnl = float(p.unrealized_pl)
             pnl_pct = float(p.unrealized_plpc) * 100
-            print(f"  {sym:<8} {qty:>6} {entry:>10.2f} {cur:>10.2f} {pnl:>+10.2f} {pnl_pct:>+7.2f}%")
+            print(f"  {sym:<8} {qty:>6.3f} {entry:>10.2f} {cur:>10.2f} {pnl:>+10.2f} {pnl_pct:>+7.2f}%")
     else:
         print("  (no open positions)")
 
@@ -88,12 +91,18 @@ def run_loop() -> None:
     executor = TradeExecutor()
 
     def exit_check():
-        if executor.broker.is_market_open():
-            executor.refresh()
-            executor.scan_exits()
+        try:
+            if executor.broker.is_market_open():
+                executor.refresh()
+                executor.scan_exits()
+        except Exception as exc:
+            log.warning("Exit check failed (will retry next cycle): %s", exc)
 
     def full_cycle():
-        executor.run_cycle()
+        try:
+            executor.run_cycle()
+        except Exception as exc:
+            log.warning("Full cycle failed (will retry next cycle): %s", exc)
 
     # Schedule jobs
     schedule.every(config.CHECK_EXITS_MINUTES).minutes.do(exit_check)
@@ -104,7 +113,10 @@ def run_loop() -> None:
 
     # Keep running
     while True:
-        schedule.run_pending()
+        try:
+            schedule.run_pending()
+        except Exception as exc:
+            log.warning("Scheduler run failed (continuing): %s", exc)
         time.sleep(30)  # sleep 30s between scheduler ticks
 
 
